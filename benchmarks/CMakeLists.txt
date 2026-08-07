@@ -1,0 +1,4 @@
+add_executable(lob_foundation_benchmark foundation_benchmark.cpp)
+target_link_libraries(lob_foundation_benchmark PRIVATE lob::engine)
+
+add_custom_target(benchmarks DEPENDS lob_foundation_benchmark)
