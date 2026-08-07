@@ -3,4 +3,8 @@ add_subdirectory(fixtures)
 add_executable(lob_smoke_test smoke_test.cpp)
 target_link_libraries(lob_smoke_test PRIVATE lob::engine lob::test_fixtures)
 
+add_executable(lob_domain_contracts_test domain_contracts_test.cpp)
+target_link_libraries(lob_domain_contracts_test PRIVATE lob::engine)
+
 add_test(NAME lob.smoke COMMAND lob_smoke_test)
+add_test(NAME lob.domain_contracts COMMAND lob_domain_contracts_test)
