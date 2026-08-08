@@ -46,7 +46,11 @@ if(LOB_ENABLE_UBSAN)
   target_link_options(lob_build_options INTERFACE -fsanitize=undefined)
 endif()
 
-add_library(lob_engine STATIC src/project.cpp)
+add_library(
+  lob_engine STATIC
+  src/order_book_storage.cpp
+  src/project.cpp
+)
 add_library(lob::engine ALIAS lob_engine)
 target_include_directories(
   lob_engine
