@@ -50,6 +50,13 @@ Queries return counts, optionals, or copied vectors of `RestingOrderView` and
 Depth means all active levels on one requested side, ordered best to worst,
 with price, aggregate leaves quantity, and active-order count.
 
+Matching uses `visit_orders_by_priority` to inspect copied, immutable order
+views without exposing storage nodes or iterators. The traversal follows each
+side's price index and each level's FIFO order. `reduce_resting_by` is the
+storage mutation used for a planned fill: it reduces leaves and the aggregate
+in place, or removes the order and empty level when the reduction exactly
+depletes leaves. It does not make crossing or amendment decisions.
+
 ## Invariant scope
 
 Debug builds perform a full structural scan through `validate_invariants()`.
