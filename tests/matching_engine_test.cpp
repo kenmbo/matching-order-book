@@ -5,17 +5,22 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace {
 
 using lob::CommandSequence;
+using lob::CancelOrder;
+using lob::CancelOrderResult;
 using lob::DepthEntry;
 using lob::EngineSequence;
 using lob::ExecutionReport;
 using lob::InstrumentId;
 using lob::MatchId;
 using lob::MatchingEngine;
+using lob::AmendOrder;
+using lob::AmendOrderResult;
 using lob::NewOrder;
 using lob::NewOrderResult;
 using lob::OrderBookResult;
@@ -67,6 +72,21 @@ NewOrderResult submit(Checks& checks, MatchingEngine& engine, OrderId id,
                       Side side, PriceTicks limit, Quantity order_quantity) {
   const auto result = engine.process(
       NewOrder{id, engine.instrument_id(), side, limit, order_quantity});
+  checks.require(engine.validate_invariants());
+  return result;
+}
+
+CancelOrderResult cancel(Checks& checks, MatchingEngine& engine, OrderId id) {
+  const auto result =
+      engine.process(CancelOrder{id, engine.instrument_id()});
+  checks.require(engine.validate_invariants());
+  return result;
+}
+
+AmendOrderResult amend(Checks& checks, MatchingEngine& engine, OrderId id,
+                       PriceTicks new_price, Quantity new_leaves_quantity) {
+  const auto result = engine.process(AmendOrder{
+      id, engine.instrument_id(), new_price, new_leaves_quantity});
   checks.require(engine.validate_invariants());
   return result;
 }
@@ -465,6 +485,516 @@ void test_duplicate_and_id_reuse(Checks& checks) {
   checks.require(engine.find_order(reusable).has_value());
 }
 
+void test_cancel_positions_unknown_and_reuse(Checks& checks) {
+  const auto instrument = instrument_id(checks, 17);
+  const auto main_price = price(checks, 100);
+  const auto lower_price = price(checks, 99);
+  const auto ask_price = price(checks, 110);
+  const auto head = order_id(checks, 1);
+  const auto sole = order_id(checks, 2);
+  const auto middle = order_id(checks, 3);
+  const auto tail = order_id(checks, 4);
+  const auto lower = order_id(checks, 5);
+  const auto ask = order_id(checks, 6);
+  MatchingEngine engine(instrument);
+
+  for (const auto id : {head, sole, middle, tail}) {
+    checks.require(submit(checks, engine, id, Side::Buy, main_price,
+                          quantity(checks, id.value()))
+                       .result == OrderBookResult::Accepted);
+  }
+  checks.require(submit(checks, engine, lower, Side::Buy, lower_price,
+                        quantity(checks, 10))
+                     .result == OrderBookResult::Accepted);
+  checks.require(submit(checks, engine, ask, Side::Sell, ask_price,
+                        quantity(checks, 20))
+                     .result == OrderBookResult::Accepted);
+
+  const auto cancel_head = cancel(checks, engine, head);
+  checks.require(cancel_head.result == OrderBookResult::Accepted &&
+                 cancel_head.reports().empty());
+  checks.require(fifo_ids(engine.orders_at_level(Side::Buy, main_price)) ==
+                 std::vector<OrderId>{sole, middle, tail});
+  checks.require(engine.level(Side::Buy, main_price)
+                     ->aggregate_leaves_quantity == quantity(checks, 9));
+
+  const auto cancel_middle = cancel(checks, engine, middle);
+  checks.require(cancel_middle.result == OrderBookResult::Accepted &&
+                 cancel_middle.reports().empty());
+  checks.require(fifo_ids(engine.orders_at_level(Side::Buy, main_price)) ==
+                 std::vector<OrderId>{sole, tail});
+  checks.require(engine.level(Side::Buy, main_price)
+                     ->aggregate_leaves_quantity == quantity(checks, 6));
+
+  const auto cancel_tail = cancel(checks, engine, tail);
+  checks.require(cancel_tail.result == OrderBookResult::Accepted &&
+                 cancel_tail.reports().empty());
+  checks.require(fifo_ids(engine.orders_at_level(Side::Buy, main_price)) ==
+                 std::vector<OrderId>{sole});
+  checks.require(engine.level(Side::Buy, main_price)
+                     ->aggregate_leaves_quantity == quantity(checks, 2));
+
+  const auto cancel_sole = cancel(checks, engine, sole);
+  checks.require(cancel_sole.result == OrderBookResult::Accepted &&
+                 cancel_sole.reports().empty());
+  checks.require(!engine.level(Side::Buy, main_price));
+  checks.require(engine.best_bid() == std::optional<PriceTicks>{lower_price});
+  checks.require(engine.best_ask() == std::optional<PriceTicks>{ask_price});
+  checks.require(engine.last_engine_sequence().value() == 0);
+  checks.require(engine.last_match_id().value() == 0);
+
+  for (const auto unknown : {order_id(checks, 999), head}) {
+    const auto before = logical_state(engine);
+    const auto command_before = engine.last_command_sequence();
+    const auto engine_before = engine.last_engine_sequence();
+    const auto rejected = cancel(checks, engine, unknown);
+    checks.require(rejected.result == OrderBookResult::OrderNotFound);
+    checks.require(!rejected.command_sequence.is_valid() &&
+                   rejected.reports().empty());
+    checks.require(logical_state(engine) == before);
+    checks.require(engine.last_command_sequence() == command_before);
+    checks.require(engine.last_engine_sequence() == engine_before);
+  }
+
+  const auto filled = order_id(checks, 20);
+  checks.require(submit(checks, engine, filled, Side::Sell, ask_price,
+                        quantity(checks, 1))
+                     .result == OrderBookResult::Accepted);
+  checks.require(submit(checks, engine, order_id(checks, 21), Side::Buy,
+                        ask_price, quantity(checks, 21))
+                     .reports()
+                     .size() == 2);
+  checks.require(!engine.find_order(filled));
+  const auto before_filled_cancel = logical_state(engine);
+  const auto command_before_filled_cancel = engine.last_command_sequence();
+  const auto filled_cancel = cancel(checks, engine, filled);
+  checks.require(filled_cancel.result == OrderBookResult::OrderNotFound);
+  checks.require(logical_state(engine) == before_filled_cancel);
+  checks.require(engine.last_command_sequence() ==
+                 command_before_filled_cancel);
+
+  const auto reused = submit(checks, engine, head, Side::Buy,
+                             price(checks, 98), quantity(checks, 7));
+  checks.require(reused.result == OrderBookResult::Accepted);
+  checks.require(engine.find_order(head).has_value());
+}
+
+void test_same_price_amend_priority(Checks& checks) {
+  const auto reduce_instrument = instrument_id(checks, 18);
+  const auto level_price = price(checks, 100);
+  const auto sole_price = price(checks, 99);
+  const auto head = order_id(checks, 1);
+  const auto middle = order_id(checks, 2);
+  const auto tail = order_id(checks, 3);
+  const auto sole = order_id(checks, 4);
+  MatchingEngine reductions(reduce_instrument);
+  checks.require(submit(checks, reductions, head, Side::Buy, level_price,
+                        quantity(checks, 10))
+                     .result == OrderBookResult::Accepted);
+  checks.require(submit(checks, reductions, middle, Side::Buy, level_price,
+                        quantity(checks, 20))
+                     .result == OrderBookResult::Accepted);
+  checks.require(submit(checks, reductions, tail, Side::Buy, level_price,
+                        quantity(checks, 30))
+                     .result == OrderBookResult::Accepted);
+  checks.require(submit(checks, reductions, sole, Side::Buy, sole_price,
+                        quantity(checks, 40))
+                     .result == OrderBookResult::Accepted);
+
+  for (const auto& [id, leaves] :
+       {std::pair{head, std::uint64_t{9}},
+        std::pair{middle, std::uint64_t{12}},
+        std::pair{tail, std::uint64_t{25}},
+        std::pair{sole, std::uint64_t{35}}}) {
+    const auto outcome = amend(checks, reductions, id,
+                               reductions.find_order(id)->price,
+                               quantity(checks, leaves));
+    checks.require(outcome.result == OrderBookResult::Accepted &&
+                   outcome.reports().empty());
+  }
+  checks.require(fifo_ids(
+                     reductions.orders_at_level(Side::Buy, level_price)) ==
+                 std::vector<OrderId>{head, middle, tail});
+  checks.require(reductions.level(Side::Buy, level_price)
+                     ->aggregate_leaves_quantity == quantity(checks, 46));
+  checks.require(fifo_ids(
+                     reductions.orders_at_level(Side::Buy, sole_price)) ==
+                 std::vector<OrderId>{sole});
+  checks.require(reductions.level(Side::Buy, sole_price)
+                     ->aggregate_leaves_quantity == quantity(checks, 35));
+
+  const auto before_noop = logical_state(reductions);
+  const auto engine_before_noop = reductions.last_engine_sequence();
+  const auto noop = amend(checks, reductions, middle, level_price,
+                          quantity(checks, 12));
+  checks.require(noop.result == OrderBookResult::Accepted &&
+                 noop.reports().empty());
+  checks.require(logical_state(reductions) == before_noop);
+  checks.require(reductions.last_engine_sequence() == engine_before_noop);
+  checks.require(reductions.last_command_sequence() == noop.command_sequence);
+  checks.require(reductions.last_match_id().value() == 0);
+
+  const auto increase_instrument = instrument_id(checks, 19);
+  MatchingEngine increases(increase_instrument);
+  const auto first = order_id(checks, 10);
+  const auto second = order_id(checks, 11);
+  const auto third = order_id(checks, 12);
+  const auto fourth = order_id(checks, 13);
+  const auto lone = order_id(checks, 14);
+  for (const auto id : {first, second, third, fourth}) {
+    checks.require(submit(checks, increases, id, Side::Sell, level_price,
+                          quantity(checks, id.value()))
+                       .result == OrderBookResult::Accepted);
+  }
+  checks.require(submit(checks, increases, lone, Side::Sell,
+                        price(checks, 101), quantity(checks, 5))
+                     .result == OrderBookResult::Accepted);
+
+  checks.require(amend(checks, increases, first, level_price,
+                       quantity(checks, 20))
+                     .result == OrderBookResult::Accepted);
+  checks.require(fifo_ids(increases.orders_at_level(Side::Sell, level_price)) ==
+                 std::vector<OrderId>{second, third, fourth, first});
+
+  checks.require(amend(checks, increases, third, level_price,
+                       quantity(checks, 30))
+                     .result == OrderBookResult::Accepted);
+  checks.require(fifo_ids(increases.orders_at_level(Side::Sell, level_price)) ==
+                 std::vector<OrderId>{second, fourth, first, third});
+
+  checks.require(amend(checks, increases, third, level_price,
+                       quantity(checks, 31))
+                     .result == OrderBookResult::Accepted);
+  checks.require(fifo_ids(increases.orders_at_level(Side::Sell, level_price)) ==
+                 std::vector<OrderId>{second, fourth, first, third});
+
+  checks.require(amend(checks, increases, lone, price(checks, 101),
+                       quantity(checks, 8))
+                     .result == OrderBookResult::Accepted);
+  checks.require(fifo_ids(
+                     increases.orders_at_level(Side::Sell, price(checks, 101))) ==
+                 std::vector<OrderId>{lone});
+  checks.require(increases.level(Side::Sell, level_price)
+                     ->aggregate_leaves_quantity == quantity(checks, 75));
+  checks.require(increases.last_engine_sequence().value() == 0);
+  checks.require(increases.last_match_id().value() == 0);
+}
+
+void test_same_price_increase_overflow_is_atomic(Checks& checks) {
+  const auto instrument = instrument_id(checks, 20);
+  const auto level_price = price(checks, 100);
+  const auto other = order_id(checks, 1);
+  const auto target = order_id(checks, 2);
+  MatchingEngine engine(instrument);
+  checks.require(submit(checks, engine, other, Side::Buy, level_price,
+                        quantity(checks,
+                                 std::numeric_limits<std::uint64_t>::max() - 1))
+                     .result == OrderBookResult::Accepted);
+  checks.require(submit(checks, engine, target, Side::Buy, level_price,
+                        quantity(checks, 1))
+                     .result == OrderBookResult::Accepted);
+
+  const auto before = logical_state(engine);
+  const auto command_before = engine.last_command_sequence();
+  const auto engine_before = engine.last_engine_sequence();
+  const auto match_before = engine.last_match_id();
+  const auto failure = amend(checks, engine, target, level_price,
+                             quantity(checks, 2));
+  checks.require(failure.result == OrderBookResult::CapacityExhausted);
+  checks.require(failure.command_sequence.value() ==
+                 command_before.value() + 1);
+  checks.require(failure.reports().empty());
+  checks.require(logical_state(engine) == before);
+  checks.require(engine.last_engine_sequence() == engine_before);
+  checks.require(engine.last_match_id() == match_before);
+}
+
+void test_non_marketable_reprice_positions_and_bbo(Checks& checks) {
+  const auto instrument = instrument_id(checks, 21);
+  const auto old_price = price(checks, 100);
+  const auto existing_price = price(checks, 98);
+  const std::vector<std::size_t> positions{0, 1, 3};
+
+  for (const auto position : positions) {
+    MatchingEngine engine(instrument);
+    const std::vector<OrderId> ids{order_id(checks, 1), order_id(checks, 2),
+                                   order_id(checks, 3), order_id(checks, 4)};
+    const auto existing = order_id(checks, 10);
+    for (const auto id : ids) {
+      checks.require(submit(checks, engine, id, Side::Buy, old_price,
+                            quantity(checks, 10))
+                         .result == OrderBookResult::Accepted);
+    }
+    checks.require(submit(checks, engine, existing, Side::Buy, existing_price,
+                          quantity(checks, 7))
+                       .result == OrderBookResult::Accepted);
+
+    const auto outcome = amend(
+        checks, engine, ids[position], existing_price,
+        quantity(checks, static_cast<std::uint64_t>(20 + position)));
+    checks.require(outcome.result == OrderBookResult::Accepted &&
+                   outcome.reports().empty());
+
+    auto expected_old = ids;
+    expected_old.erase(expected_old.begin() +
+                       static_cast<std::ptrdiff_t>(position));
+    checks.require(fifo_ids(engine.orders_at_level(Side::Buy, old_price)) ==
+                   expected_old);
+    checks.require(fifo_ids(
+                       engine.orders_at_level(Side::Buy, existing_price)) ==
+                   std::vector<OrderId>{existing, ids[position]});
+    checks.require(engine.find_order(ids[position])->price == existing_price);
+    checks.require(engine.find_order(ids[position])->leaves_quantity ==
+                   quantity(checks,
+                            static_cast<std::uint64_t>(20 + position)));
+    checks.require(engine.best_bid() == std::optional<PriceTicks>{old_price});
+    checks.require(engine.last_engine_sequence().value() == 0);
+  }
+
+  MatchingEngine sole_engine(instrument);
+  const auto target = order_id(checks, 20);
+  const auto other = order_id(checks, 21);
+  const auto ask = order_id(checks, 22);
+  const auto other_price = price(checks, 99);
+  const auto new_best = price(checks, 102);
+  checks.require(submit(checks, sole_engine, target, Side::Buy, old_price,
+                        quantity(checks, 5))
+                     .result == OrderBookResult::Accepted);
+  checks.require(submit(checks, sole_engine, other, Side::Buy, other_price,
+                        quantity(checks, 3))
+                     .result == OrderBookResult::Accepted);
+  checks.require(submit(checks, sole_engine, ask, Side::Sell,
+                        price(checks, 110), quantity(checks, 4))
+                     .result == OrderBookResult::Accepted);
+
+  checks.require(amend(checks, sole_engine, target, new_best,
+                       quantity(checks, 6))
+                     .result == OrderBookResult::Accepted);
+  checks.require(!sole_engine.level(Side::Buy, old_price));
+  checks.require(sole_engine.best_bid() ==
+                 std::optional<PriceTicks>{new_best});
+  checks.require(sole_engine.find_order(target)->leaves_quantity ==
+                 quantity(checks, 6));
+
+  checks.require(amend(checks, sole_engine, target, other_price,
+                       quantity(checks, 8))
+                     .result == OrderBookResult::Accepted);
+  checks.require(!sole_engine.level(Side::Buy, new_best));
+  checks.require(sole_engine.best_bid() ==
+                 std::optional<PriceTicks>{other_price});
+  checks.require(fifo_ids(
+                     sole_engine.orders_at_level(Side::Buy, other_price)) ==
+                 std::vector<OrderId>{other, target});
+  checks.require(sole_engine.level(Side::Buy, other_price)
+                     ->aggregate_leaves_quantity == quantity(checks, 11));
+  checks.require(sole_engine.best_ask() ==
+                 std::optional<PriceTicks>{price(checks, 110)});
+}
+
+void test_reprice_final_capacity_and_failure_atomicity(Checks& checks) {
+  const auto instrument = instrument_id(checks, 22);
+
+  MatchingEngine released_level(instrument, StorageLimits{2, 2});
+  const auto target = order_id(checks, 1);
+  const auto other = order_id(checks, 2);
+  checks.require(submit(checks, released_level, target, Side::Buy,
+                        price(checks, 90), quantity(checks, 3))
+                     .result == OrderBookResult::Accepted);
+  checks.require(submit(checks, released_level, other, Side::Buy,
+                        price(checks, 91), quantity(checks, 4))
+                     .result == OrderBookResult::Accepted);
+  checks.require(amend(checks, released_level, target, price(checks, 92),
+                       quantity(checks, 5))
+                     .result == OrderBookResult::Accepted);
+  checks.require(released_level.price_level_count(Side::Buy) == 2);
+  checks.require(released_level.best_bid() ==
+                 std::optional<PriceTicks>{price(checks, 92)});
+
+  MatchingEngine level_full(instrument, StorageLimits{4, 2});
+  const auto sibling = order_id(checks, 10);
+  const auto blocked = order_id(checks, 11);
+  const auto second_level = order_id(checks, 12);
+  checks.require(submit(checks, level_full, sibling, Side::Buy,
+                        price(checks, 90), quantity(checks, 1))
+                     .result == OrderBookResult::Accepted);
+  checks.require(submit(checks, level_full, blocked, Side::Buy,
+                        price(checks, 90), quantity(checks, 2))
+                     .result == OrderBookResult::Accepted);
+  checks.require(submit(checks, level_full, second_level, Side::Buy,
+                        price(checks, 91), quantity(checks, 3))
+                     .result == OrderBookResult::Accepted);
+  const auto before_level_failure = logical_state(level_full);
+  const auto command_before_level_failure =
+      level_full.last_command_sequence();
+  const auto level_failure = amend(checks, level_full, blocked,
+                                   price(checks, 92), quantity(checks, 5));
+  checks.require(level_failure.result == OrderBookResult::CapacityExhausted);
+  checks.require(level_failure.command_sequence.value() ==
+                 command_before_level_failure.value() + 1);
+  checks.require(logical_state(level_full) == before_level_failure);
+  checks.require(fifo_ids(
+                     level_full.orders_at_level(Side::Buy, price(checks, 90))) ==
+                 std::vector<OrderId>{sibling, blocked});
+  checks.require(level_full.last_engine_sequence().value() == 0);
+  checks.require(level_full.last_match_id().value() == 0);
+
+  MatchingEngine aggregate_full(instrument, StorageLimits{3, 3});
+  const auto maximum_order = order_id(checks, 20);
+  const auto aggregate_target = order_id(checks, 21);
+  checks.require(submit(checks, aggregate_full, maximum_order, Side::Buy,
+                        price(checks, 100),
+                        quantity(checks,
+                                 std::numeric_limits<std::uint64_t>::max()))
+                     .result == OrderBookResult::Accepted);
+  checks.require(submit(checks, aggregate_full, aggregate_target, Side::Buy,
+                        price(checks, 90), quantity(checks, 1))
+                     .result == OrderBookResult::Accepted);
+  const auto before_aggregate_failure = logical_state(aggregate_full);
+  const auto aggregate_failure =
+      amend(checks, aggregate_full, aggregate_target, price(checks, 100),
+            quantity(checks, 1));
+  checks.require(aggregate_failure.result ==
+                 OrderBookResult::CapacityExhausted);
+  checks.require(logical_state(aggregate_full) == before_aggregate_failure);
+  checks.require(aggregate_full.last_engine_sequence().value() == 0);
+  checks.require(aggregate_full.last_match_id().value() == 0);
+}
+
+void test_marketable_amendment_multi_level_and_remainder(Checks& checks) {
+  const auto instrument = instrument_id(checks, 23);
+  const auto target = order_id(checks, 1);
+  const auto ask_100 = order_id(checks, 2);
+  const auto ask_101 = order_id(checks, 3);
+  const auto ask_103 = order_id(checks, 4);
+  const auto price_100 = price(checks, 100);
+  const auto price_101 = price(checks, 101);
+  const auto price_103 = price(checks, 103);
+  MatchingEngine engine(instrument);
+
+  checks.require(submit(checks, engine, target, Side::Buy, price(checks, 90),
+                        quantity(checks, 10))
+                     .result == OrderBookResult::Accepted);
+  checks.require(submit(checks, engine, ask_101, Side::Sell, price_101,
+                        quantity(checks, 10))
+                     .result == OrderBookResult::Accepted);
+  checks.require(submit(checks, engine, ask_100, Side::Sell, price_100,
+                        quantity(checks, 5))
+                     .result == OrderBookResult::Accepted);
+  checks.require(submit(checks, engine, ask_103, Side::Sell, price_103,
+                        quantity(checks, 9))
+                     .result == OrderBookResult::Accepted);
+
+  const auto result = amend(checks, engine, target, price_101,
+                            quantity(checks, 20));
+  checks.require(result.result == OrderBookResult::Accepted);
+  checks.require(result.reports().size() == 2);
+  checks.require(report_equals(
+      result.reports()[0], make_domain<MatchId>(checks, std::uint64_t{1}),
+      instrument, target, ask_100, price_100, quantity(checks, 5),
+      make_domain<EngineSequence>(checks, std::uint64_t{1})));
+  checks.require(report_equals(
+      result.reports()[1], make_domain<MatchId>(checks, std::uint64_t{2}),
+      instrument, target, ask_101, price_101, quantity(checks, 10),
+      make_domain<EngineSequence>(checks, std::uint64_t{2})));
+  checks.require(!engine.find_order(ask_100));
+  checks.require(!engine.find_order(ask_101));
+  checks.require(engine.find_order(ask_103)->leaves_quantity ==
+                 quantity(checks, 9));
+  checks.require(engine.find_order(target) ==
+                 std::optional<RestingOrderView>{{target, instrument, Side::Buy,
+                                                  price_101,
+                                                  quantity(checks, 5)}});
+  checks.require(engine.best_bid() == std::optional<PriceTicks>{price_101});
+  checks.require(engine.best_ask() == std::optional<PriceTicks>{price_103});
+  checks.require(engine.last_command_sequence() == result.command_sequence);
+  checks.require(engine.last_engine_sequence().value() == 2);
+  checks.require(engine.last_match_id().value() == 2);
+}
+
+void test_marketable_amendment_sell_and_partial_resting_fill(Checks& checks) {
+  const auto instrument = instrument_id(checks, 24);
+  const auto target = order_id(checks, 1);
+  const auto best_bid = order_id(checks, 2);
+  const auto lower_bid = order_id(checks, 3);
+  const auto price_100 = price(checks, 100);
+  const auto price_99 = price(checks, 99);
+  MatchingEngine engine(instrument);
+
+  checks.require(submit(checks, engine, target, Side::Sell, price(checks, 110),
+                        quantity(checks, 9))
+                     .result == OrderBookResult::Accepted);
+  checks.require(submit(checks, engine, best_bid, Side::Buy, price_100,
+                        quantity(checks, 10))
+                     .result == OrderBookResult::Accepted);
+  checks.require(submit(checks, engine, lower_bid, Side::Buy, price_99,
+                        quantity(checks, 8))
+                     .result == OrderBookResult::Accepted);
+
+  const auto result = amend(checks, engine, target, price_100,
+                            quantity(checks, 4));
+  checks.require(result.result == OrderBookResult::Accepted &&
+                 result.reports().size() == 1);
+  checks.require(result.reports()[0].aggressive_order_id == target);
+  checks.require(result.reports()[0].resting_order_id == best_bid);
+  checks.require(result.reports()[0].match_price == price_100);
+  checks.require(result.reports()[0].match_quantity == quantity(checks, 4));
+  checks.require(!engine.find_order(target));
+  checks.require(engine.find_order(best_bid)->leaves_quantity ==
+                 quantity(checks, 6));
+  checks.require(engine.find_order(lower_bid)->leaves_quantity ==
+                 quantity(checks, 8));
+  checks.require(engine.best_bid() == std::optional<PriceTicks>{price_100});
+  checks.require(!engine.best_ask());
+
+  const auto reused = submit(checks, engine, target, Side::Sell,
+                             price(checks, 110), quantity(checks, 2));
+  checks.require(reused.result == OrderBookResult::Accepted);
+  checks.require(engine.find_order(target).has_value());
+}
+
+void test_marketable_amendment_fifo_sweep(Checks& checks) {
+  const auto instrument = instrument_id(checks, 25);
+  const auto target = order_id(checks, 1);
+  const auto first = order_id(checks, 2);
+  const auto second = order_id(checks, 3);
+  const auto third = order_id(checks, 4);
+  const auto fourth = order_id(checks, 5);
+  const auto level_price = price(checks, 100);
+  MatchingEngine engine(instrument);
+
+  checks.require(submit(checks, engine, target, Side::Buy, price(checks, 90),
+                        quantity(checks, 20))
+                     .result == OrderBookResult::Accepted);
+  for (const auto& [id, leaves] :
+       {std::pair{first, std::uint64_t{2}},
+        std::pair{second, std::uint64_t{3}},
+        std::pair{third, std::uint64_t{7}},
+        std::pair{fourth, std::uint64_t{4}}}) {
+    checks.require(submit(checks, engine, id, Side::Sell, level_price,
+                          quantity(checks, leaves))
+                       .result == OrderBookResult::Accepted);
+  }
+
+  const auto result = amend(checks, engine, target, level_price,
+                            quantity(checks, 6));
+  checks.require(result.result == OrderBookResult::Accepted &&
+                 result.reports().size() == 3);
+  checks.require(result.reports()[0].resting_order_id == first &&
+                 result.reports()[0].match_quantity == quantity(checks, 2));
+  checks.require(result.reports()[1].resting_order_id == second &&
+                 result.reports()[1].match_quantity == quantity(checks, 3));
+  checks.require(result.reports()[2].resting_order_id == third &&
+                 result.reports()[2].match_quantity == quantity(checks, 1));
+  checks.require(!engine.find_order(target));
+  checks.require(!engine.find_order(first) && !engine.find_order(second));
+  checks.require(engine.find_order(third)->leaves_quantity ==
+                 quantity(checks, 6));
+  checks.require(fifo_ids(engine.orders_at_level(Side::Sell, level_price)) ==
+                 std::vector<OrderId>{third, fourth});
+  checks.require(engine.level(Side::Sell, level_price)
+                     ->aggregate_leaves_quantity == quantity(checks, 10));
+}
+
 void test_invalid_commands_are_atomic(Checks& checks) {
   const auto instrument = instrument_id(checks, 11);
   MatchingEngine engine(instrument);
@@ -494,6 +1024,63 @@ void test_invalid_commands_are_atomic(Checks& checks) {
   checks.require(logical_state(engine) == before);
   checks.require(engine.last_command_sequence().value() == 0);
   checks.require(engine.last_engine_sequence().value() == 0);
+}
+
+void test_cancel_and_amend_validation_is_atomic(Checks& checks) {
+  const auto instrument = instrument_id(checks, 26);
+  const auto other_instrument = instrument_id(checks, 27);
+  const auto target = order_id(checks, 1);
+  const auto level_price = price(checks, 100);
+  const auto leaves = quantity(checks, 10);
+  MatchingEngine engine(instrument);
+  checks.require(submit(checks, engine, target, Side::Buy, level_price, leaves)
+                     .result == OrderBookResult::Accepted);
+
+  const auto before = logical_state(engine);
+  const auto command_before = engine.last_command_sequence();
+  const auto engine_before = engine.last_engine_sequence();
+  const auto match_before = engine.last_match_id();
+
+  const auto wrong_cancel =
+      engine.process(CancelOrder{target, other_instrument});
+  checks.require(engine.validate_invariants());
+  checks.require(wrong_cancel.result == OrderBookResult::InvalidInstrument);
+
+  const auto wrong_amend = engine.process(
+      AmendOrder{target, other_instrument, level_price, leaves});
+  checks.require(engine.validate_invariants());
+  checks.require(wrong_amend.result == OrderBookResult::InvalidInstrument);
+
+  const auto unknown_amend = engine.process(
+      AmendOrder{order_id(checks, 999), instrument, level_price, leaves});
+  checks.require(engine.validate_invariants());
+  checks.require(unknown_amend.result == OrderBookResult::OrderNotFound);
+
+  const auto invalid_price = engine.process(
+      AmendOrder{target, instrument, PriceTicks{}, leaves});
+  checks.require(engine.validate_invariants());
+  checks.require(invalid_price.result == OrderBookResult::InvalidPrice);
+
+  const auto zero_quantity = engine.process(
+      AmendOrder{target, instrument, level_price, Quantity{}});
+  checks.require(engine.validate_invariants());
+  checks.require(zero_quantity.result == OrderBookResult::InvalidAmendment);
+
+  const auto invalid_cancel =
+      engine.process(CancelOrder{OrderId{}, instrument});
+  checks.require(engine.validate_invariants());
+  checks.require(invalid_cancel.result == OrderBookResult::OrderNotFound);
+
+  checks.require(logical_state(engine) == before);
+  checks.require(engine.last_command_sequence() == command_before);
+  checks.require(engine.last_engine_sequence() == engine_before);
+  checks.require(engine.last_match_id() == match_before);
+  for (const auto* result : {&wrong_cancel, &wrong_amend, &unknown_amend,
+                             &invalid_price, &zero_quantity,
+                             &invalid_cancel}) {
+    checks.require(!result->command_sequence.is_valid());
+    checks.require(result->reports().empty());
+  }
 }
 
 void test_fill_capacity_boundary(Checks& checks) {
@@ -544,6 +1131,77 @@ void test_fill_capacity_boundary(Checks& checks) {
   checks.require(after_failure.reports().size() == 1);
   checks.require(after_failure.reports()[0].engine_sequence.value() == 1);
   checks.require(after_failure.reports()[0].match_id.value() == 1);
+}
+
+void test_amend_fill_capacity_boundary(Checks& checks) {
+  const auto instrument = instrument_id(checks, 28);
+  const auto old_price = price(checks, 90);
+  const auto crossing_price = price(checks, 100);
+  const auto one = quantity(checks, 1);
+
+  MatchingEngine permitted(instrument);
+  const auto permitted_target = order_id(checks, 1);
+  checks.require(submit(checks, permitted, permitted_target, Side::Buy,
+                        old_price, quantity(checks, 256))
+                     .result == OrderBookResult::Accepted);
+  for (std::uint64_t value = 1; value <= 256; ++value) {
+    checks.require(submit(checks, permitted,
+                          order_id(checks, 1'000 + value), Side::Sell,
+                          crossing_price, one)
+                       .result == OrderBookResult::Accepted);
+  }
+  const auto success = amend(checks, permitted, permitted_target,
+                             crossing_price, quantity(checks, 256));
+  checks.require(success.result == OrderBookResult::Accepted);
+  checks.require(success.reports().size() == 256);
+  for (std::size_t index = 0; index < success.reports().size(); ++index) {
+    checks.require(success.reports()[index].aggressive_order_id ==
+                   permitted_target);
+    checks.require(success.reports()[index].resting_order_id.value() ==
+                   std::uint64_t{1'001} +
+                       static_cast<std::uint64_t>(index));
+    checks.require(success.reports()[index].match_quantity == one);
+    checks.require(success.reports()[index].engine_sequence.value() ==
+                   static_cast<std::uint64_t>(index) + 1);
+    checks.require(success.reports()[index].match_id.value() ==
+                   static_cast<std::uint64_t>(index) + 1);
+  }
+  checks.require(permitted.active_order_count() == 0);
+
+  MatchingEngine rejected(instrument);
+  const auto rejected_target = order_id(checks, 2);
+  const auto sibling = order_id(checks, 3);
+  checks.require(submit(checks, rejected, rejected_target, Side::Buy,
+                        old_price, quantity(checks, 257))
+                     .result == OrderBookResult::Accepted);
+  checks.require(submit(checks, rejected, sibling, Side::Buy, old_price,
+                        quantity(checks, 9))
+                     .result == OrderBookResult::Accepted);
+  for (std::uint64_t value = 1; value <= 257; ++value) {
+    checks.require(submit(checks, rejected,
+                          order_id(checks, 2'000 + value), Side::Sell,
+                          crossing_price, one)
+                       .result == OrderBookResult::Accepted);
+  }
+
+  const auto before = logical_state(rejected);
+  const auto command_before = rejected.last_command_sequence();
+  const auto engine_before = rejected.last_engine_sequence();
+  const auto match_before = rejected.last_match_id();
+  const auto failure = amend(checks, rejected, rejected_target,
+                             crossing_price, quantity(checks, 257));
+  checks.require(failure.result == OrderBookResult::CapacityExhausted);
+  checks.require(failure.command_sequence.value() ==
+                 command_before.value() + 1);
+  checks.require(failure.reports().empty());
+  checks.require(logical_state(rejected) == before);
+  checks.require(rejected.find_order(rejected_target)->price == old_price);
+  checks.require(rejected.find_order(rejected_target)->leaves_quantity ==
+                 quantity(checks, 257));
+  checks.require(fifo_ids(rejected.orders_at_level(Side::Buy, old_price)) ==
+                 std::vector<OrderId>{rejected_target, sibling});
+  checks.require(rejected.last_engine_sequence() == engine_before);
+  checks.require(rejected.last_match_id() == match_before);
 }
 
 void test_final_state_capacity_preflight(Checks& checks) {
@@ -670,8 +1328,18 @@ int main() {
   test_buy_multi_level_limit_stop(checks);
   test_sell_multi_level_and_exact_consumption(checks);
   test_duplicate_and_id_reuse(checks);
+  test_cancel_positions_unknown_and_reuse(checks);
+  test_same_price_amend_priority(checks);
+  test_same_price_increase_overflow_is_atomic(checks);
+  test_non_marketable_reprice_positions_and_bbo(checks);
+  test_reprice_final_capacity_and_failure_atomicity(checks);
+  test_marketable_amendment_multi_level_and_remainder(checks);
+  test_marketable_amendment_sell_and_partial_resting_fill(checks);
+  test_marketable_amendment_fifo_sweep(checks);
   test_invalid_commands_are_atomic(checks);
+  test_cancel_and_amend_validation_is_atomic(checks);
   test_fill_capacity_boundary(checks);
+  test_amend_fill_capacity_boundary(checks);
   test_final_state_capacity_preflight(checks);
   test_determinism(checks);
   return checks.passed() ? 0 : 1;
