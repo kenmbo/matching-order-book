@@ -48,6 +48,7 @@ endif()
 
 add_library(
   lob_engine STATIC
+  src/matching_engine.cpp
   src/order_book_storage.cpp
   src/project.cpp
 )
