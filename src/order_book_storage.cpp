@@ -139,6 +139,55 @@ OrderBookResult OrderBookStorage::remove_resting(OrderId order_id) {
   return remove_ask(indexed_order);
 }
 
+OrderBookResult OrderBookStorage::reduce_resting_by(
+    OrderId order_id, Quantity reduction) noexcept {
+  const auto indexed_order = orders_.find(order_id);
+  if (indexed_order == orders_.end()) {
+    return OrderBookResult::OrderNotFound;
+  }
+  if (!reduction.is_valid() ||
+      reduction > indexed_order->second.order->leaves_quantity) {
+    return OrderBookResult::InvalidQuantity;
+  }
+  if (reduction == indexed_order->second.order->leaves_quantity) {
+    return remove_resting(order_id);
+  }
+
+  const auto new_leaves = checked_subtract(
+      indexed_order->second.order->leaves_quantity, reduction);
+  if (!new_leaves.has_value()) {
+    return OrderBookResult::InvalidQuantity;
+  }
+
+  if (indexed_order->second.side == Side::Buy) {
+    const auto level = bids_.find(indexed_order->second.price);
+    if (level == bids_.end()) {
+      return OrderBookResult::OrderNotFound;
+    }
+    const auto aggregate =
+        checked_subtract(level->second.aggregate_leaves_quantity, reduction);
+    if (!aggregate.has_value()) {
+      return OrderBookResult::InvalidQuantity;
+    }
+    indexed_order->second.order->leaves_quantity = new_leaves.value;
+    level->second.aggregate_leaves_quantity = aggregate.value;
+    return OrderBookResult::Accepted;
+  }
+
+  const auto level = asks_.find(indexed_order->second.price);
+  if (level == asks_.end()) {
+    return OrderBookResult::OrderNotFound;
+  }
+  const auto aggregate =
+      checked_subtract(level->second.aggregate_leaves_quantity, reduction);
+  if (!aggregate.has_value()) {
+    return OrderBookResult::InvalidQuantity;
+  }
+  indexed_order->second.order->leaves_quantity = new_leaves.value;
+  level->second.aggregate_leaves_quantity = aggregate.value;
+  return OrderBookResult::Accepted;
+}
+
 OrderBookResult OrderBookStorage::remove_bid(
     OrderIndex::iterator indexed_order) {
   const auto level = bids_.find(indexed_order->second.price);

@@ -55,6 +55,8 @@ class OrderBookStorage final {
       OrderId order_id, InstrumentId instrument_id, Side side, PriceTicks price,
       Quantity leaves_quantity);
   [[nodiscard]] OrderBookResult remove_resting(OrderId order_id);
+  [[nodiscard]] OrderBookResult reduce_resting_by(
+      OrderId order_id, Quantity reduction) noexcept;
 
   [[nodiscard]] InstrumentId instrument_id() const noexcept;
   [[nodiscard]] std::size_t active_order_count() const noexcept;
@@ -71,6 +73,29 @@ class OrderBookStorage final {
   [[nodiscard]] std::vector<DepthEntry> depth(Side side) const;
   [[nodiscard]] std::vector<RestingOrderView> orders_at_level(
       Side side, PriceTicks price) const;
+
+  template <typename Visitor>
+  void visit_orders_by_priority(Side side, Visitor&& visitor) const {
+    const auto visit_levels = [&visitor](const auto& levels) {
+      for (const auto& [price, level] : levels) {
+        static_cast<void>(price);
+        for (const auto& order : level.fifo) {
+          const RestingOrderView view{order.order_id, order.instrument_id,
+                                      order.side, order.price,
+                                      order.leaves_quantity};
+          if (!std::invoke(visitor, view)) {
+            return;
+          }
+        }
+      }
+    };
+
+    if (side == Side::Buy) {
+      visit_levels(bids_);
+    } else if (side == Side::Sell) {
+      visit_levels(asks_);
+    }
+  }
 
 #ifndef NDEBUG
   [[nodiscard]] bool validate_invariants() const noexcept;
