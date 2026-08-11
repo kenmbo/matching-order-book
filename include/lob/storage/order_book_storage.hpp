@@ -57,6 +57,10 @@ class OrderBookStorage final {
   [[nodiscard]] OrderBookResult remove_resting(OrderId order_id);
   [[nodiscard]] OrderBookResult reduce_resting_by(
       OrderId order_id, Quantity reduction) noexcept;
+  [[nodiscard]] OrderBookResult update_resting_leaves(
+      OrderId order_id, Quantity new_leaves_quantity) noexcept;
+  [[nodiscard]] OrderBookResult move_resting_to_back(
+      OrderId order_id) noexcept;
 
   [[nodiscard]] InstrumentId instrument_id() const noexcept;
   [[nodiscard]] std::size_t active_order_count() const noexcept;

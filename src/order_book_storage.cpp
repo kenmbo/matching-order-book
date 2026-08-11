@@ -188,6 +188,90 @@ OrderBookResult OrderBookStorage::reduce_resting_by(
   return OrderBookResult::Accepted;
 }
 
+OrderBookResult OrderBookStorage::update_resting_leaves(
+    OrderId order_id, Quantity new_leaves_quantity) noexcept {
+  const auto indexed_order = orders_.find(order_id);
+  if (indexed_order == orders_.end()) {
+    return OrderBookResult::OrderNotFound;
+  }
+  if (!new_leaves_quantity.is_valid()) {
+    return OrderBookResult::InvalidQuantity;
+  }
+
+  const auto old_leaves = indexed_order->second.order->leaves_quantity;
+  if (new_leaves_quantity == old_leaves) {
+    return OrderBookResult::Accepted;
+  }
+
+  const auto update_level = [&](auto& levels) noexcept {
+    const auto level = levels.find(indexed_order->second.price);
+    if (level == levels.end()) {
+      return OrderBookResult::OrderNotFound;
+    }
+
+    CheckedQuantity new_aggregate;
+    if (new_leaves_quantity < old_leaves) {
+      const auto reduction = checked_subtract(old_leaves, new_leaves_quantity);
+      if (!reduction.has_value()) {
+        return OrderBookResult::InvalidQuantity;
+      }
+      new_aggregate = checked_subtract(
+          level->second.aggregate_leaves_quantity, reduction.value);
+      if (!new_aggregate.has_value()) {
+        return OrderBookResult::InvalidQuantity;
+      }
+    } else {
+      const auto increase = checked_subtract(new_leaves_quantity, old_leaves);
+      if (!increase.has_value()) {
+        return OrderBookResult::InvalidQuantity;
+      }
+      new_aggregate = checked_add(level->second.aggregate_leaves_quantity,
+                                  increase.value);
+      if (!new_aggregate.has_value()) {
+        return OrderBookResult::CapacityExhausted;
+      }
+    }
+
+    indexed_order->second.order->leaves_quantity = new_leaves_quantity;
+    level->second.aggregate_leaves_quantity = new_aggregate.value;
+    return OrderBookResult::Accepted;
+  };
+
+  if (indexed_order->second.side == Side::Buy) {
+    return update_level(bids_);
+  }
+  if (indexed_order->second.side == Side::Sell) {
+    return update_level(asks_);
+  }
+  return OrderBookResult::OrderNotFound;
+}
+
+OrderBookResult OrderBookStorage::move_resting_to_back(
+    OrderId order_id) noexcept {
+  const auto indexed_order = orders_.find(order_id);
+  if (indexed_order == orders_.end()) {
+    return OrderBookResult::OrderNotFound;
+  }
+
+  const auto move_in_level = [&](auto& levels) noexcept {
+    const auto level = levels.find(indexed_order->second.price);
+    if (level == levels.end()) {
+      return OrderBookResult::OrderNotFound;
+    }
+    level->second.fifo.splice(level->second.fifo.end(), level->second.fifo,
+                              indexed_order->second.order);
+    return OrderBookResult::Accepted;
+  };
+
+  if (indexed_order->second.side == Side::Buy) {
+    return move_in_level(bids_);
+  }
+  if (indexed_order->second.side == Side::Sell) {
+    return move_in_level(asks_);
+  }
+  return OrderBookResult::OrderNotFound;
+}
+
 OrderBookResult OrderBookStorage::remove_bid(
     OrderIndex::iterator indexed_order) {
   const auto level = bids_.find(indexed_order->second.price);
