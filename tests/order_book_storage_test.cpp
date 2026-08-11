@@ -289,6 +289,48 @@ void test_removal_positions(Checks& checks) {
   require_invariants(checks, book);
 }
 
+void test_fill_reduction(Checks& checks) {
+  const auto instrument = instrument_id(checks, 14);
+  const auto level_price = price(checks, 100);
+  const auto first = order_id(checks, 1);
+  const auto second = order_id(checks, 2);
+  OrderBookStorage book(instrument);
+
+  checks.require(book.insert_resting(first, instrument, Side::Sell, level_price,
+                                     quantity(checks, 10)) ==
+                 OrderBookResult::Accepted);
+  require_invariants(checks, book);
+  checks.require(book.insert_resting(second, instrument, Side::Sell, level_price,
+                                     quantity(checks, 5)) ==
+                 OrderBookResult::Accepted);
+  require_invariants(checks, book);
+
+  checks.require(book.reduce_resting_by(first, quantity(checks, 4)) ==
+                 OrderBookResult::Accepted);
+  checks.require(book.find_order(first)->leaves_quantity == quantity(checks, 6));
+  checks.require(fifo_ids(book.orders_at_level(Side::Sell, level_price)) ==
+                 std::vector<OrderId>{first, second});
+  checks.require(book.level(Side::Sell, level_price)
+                     ->aggregate_leaves_quantity == quantity(checks, 11));
+  require_invariants(checks, book);
+
+  const auto before_invalid = logical_state(book);
+  checks.require(book.reduce_resting_by(first, quantity(checks, 7)) ==
+                 OrderBookResult::InvalidQuantity);
+  checks.require(logical_state(book) == before_invalid);
+  require_invariants(checks, book);
+
+  checks.require(book.reduce_resting_by(first, quantity(checks, 6)) ==
+                 OrderBookResult::Accepted);
+  checks.require(!book.find_order(first));
+  checks.require(fifo_ids(book.orders_at_level(Side::Sell, level_price)) ==
+                 std::vector<OrderId>{second});
+  checks.require(book.level(Side::Sell, level_price) ==
+                 std::optional<DepthEntry>{
+                     {level_price, quantity(checks, 5), 1}});
+  require_invariants(checks, book);
+}
+
 void test_duplicate_and_reuse(Checks& checks) {
   const auto instrument = instrument_id(checks, 6);
   const auto id = order_id(checks, 77);
@@ -466,6 +508,7 @@ int main() {
   test_fifo_and_aggregate(checks);
   test_price_ordering_and_mixed_book(checks);
   test_removal_positions(checks);
+  test_fill_reduction(checks);
   test_duplicate_and_reuse(checks);
   test_active_order_capacity(checks);
   test_level_capacity(checks, Side::Buy);

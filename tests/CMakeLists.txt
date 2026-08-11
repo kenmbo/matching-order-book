@@ -9,6 +9,10 @@ target_link_libraries(lob_domain_contracts_test PRIVATE lob::engine)
 add_executable(lob_order_book_storage_test order_book_storage_test.cpp)
 target_link_libraries(lob_order_book_storage_test PRIVATE lob::engine)
 
+add_executable(lob_matching_engine_test matching_engine_test.cpp)
+target_link_libraries(lob_matching_engine_test PRIVATE lob::engine)
+
 add_test(NAME lob.smoke COMMAND lob_smoke_test)
 add_test(NAME lob.domain_contracts COMMAND lob_domain_contracts_test)
 add_test(NAME lob.order_book_storage COMMAND lob_order_book_storage_test)
+add_test(NAME lob.matching_engine COMMAND lob_matching_engine_test)
