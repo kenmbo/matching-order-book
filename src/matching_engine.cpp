@@ -38,34 +38,133 @@ NewOrderResult MatchingEngine::process(const NewOrder& order) {
     return result;
   }
 
-  if (sequences_.last_command().value() ==
-      CommandSequence::maximum_value) {
+  if (!command_sequence_available()) {
     result.result = OrderBookResult::CapacityExhausted;
     sequences_.reject_before_acceptance();
     return result;
   }
 
-  const auto command_assignment = sequences_.accept_command();
-  if (!command_assignment.assigned()) {
-    fail_plan_execution();
-  }
-  result.command_sequence = command_assignment.sequence;
+  result.command_sequence = accept_command();
+  const LogicalOrder logical_order{order.order_id, order.instrument_id,
+                                   order.side, order.limit_price,
+                                   order.quantity};
 
-  const auto planned = plan_new_order(order);
+  const auto planned = plan_order(logical_order);
   if (planned.result != OrderBookResult::Accepted) {
     result.result = planned.result;
     sequences_.abort_event_batch();
     return result;
   }
 
-  result.result = preflight_plan(order, planned.plan);
+  result.result = preflight_plan(logical_order, planned.plan, std::nullopt);
   if (result.result != OrderBookResult::Accepted) {
     sequences_.abort_event_batch();
     return result;
   }
 
-  execute_plan(order, planned.plan);
-  materialize_reports(order, planned.plan, result);
+  execute_plan(logical_order, planned.plan, std::nullopt);
+  materialize_reports(logical_order, planned.plan, result);
+  result.result = OrderBookResult::Accepted;
+
+#ifndef NDEBUG
+  assert(validate_invariants());
+#endif
+  return result;
+}
+
+CancelOrderResult MatchingEngine::process(const CancelOrder& order) {
+  CancelOrderResult result;
+  result.result = validate_cancel_order(order);
+  if (result.result != OrderBookResult::Accepted) {
+    sequences_.reject_before_acceptance();
+    return result;
+  }
+  if (!command_sequence_available()) {
+    result.result = OrderBookResult::CapacityExhausted;
+    sequences_.reject_before_acceptance();
+    return result;
+  }
+
+  result.command_sequence = accept_command();
+  if (storage_.remove_resting(order.order_id) != OrderBookResult::Accepted) {
+    fail_plan_execution();
+  }
+  const auto event_batch = sequences_.commit_event_batch(0);
+  if (!event_batch.empty()) {
+    fail_plan_execution();
+  }
+  result.result = OrderBookResult::Accepted;
+
+#ifndef NDEBUG
+  assert(validate_invariants());
+#endif
+  return result;
+}
+
+AmendOrderResult MatchingEngine::process(const AmendOrder& order) {
+  AmendOrderResult result;
+  const auto resting = storage_.find_order(order.order_id);
+  result.result = validate_amend_order(order, resting);
+  if (result.result != OrderBookResult::Accepted) {
+    sequences_.reject_before_acceptance();
+    return result;
+  }
+  if (!command_sequence_available()) {
+    result.result = OrderBookResult::CapacityExhausted;
+    sequences_.reject_before_acceptance();
+    return result;
+  }
+
+  result.command_sequence = accept_command();
+  if (order.new_price == resting->price) {
+    if (order.new_leaves_quantity != resting->leaves_quantity) {
+      result.result = storage_.update_resting_leaves(
+          order.order_id, order.new_leaves_quantity);
+      if (result.result == OrderBookResult::CapacityExhausted) {
+        sequences_.abort_event_batch();
+        return result;
+      }
+      if (result.result != OrderBookResult::Accepted) {
+        fail_plan_execution();
+      }
+
+      if (order.new_leaves_quantity > resting->leaves_quantity &&
+          storage_.move_resting_to_back(order.order_id) !=
+              OrderBookResult::Accepted) {
+        fail_plan_execution();
+      }
+    }
+
+    const auto event_batch = sequences_.commit_event_batch(0);
+    if (!event_batch.empty()) {
+      fail_plan_execution();
+    }
+    result.result = OrderBookResult::Accepted;
+
+#ifndef NDEBUG
+    assert(validate_invariants());
+#endif
+    return result;
+  }
+
+  const LogicalOrder logical_order{order.order_id, order.instrument_id,
+                                   resting->side, order.new_price,
+                                   order.new_leaves_quantity};
+  const auto planned = plan_order(logical_order);
+  if (planned.result != OrderBookResult::Accepted) {
+    result.result = planned.result;
+    sequences_.abort_event_batch();
+    return result;
+  }
+
+  result.result = preflight_plan(logical_order, planned.plan, resting);
+  if (result.result != OrderBookResult::Accepted) {
+    sequences_.abort_event_batch();
+    return result;
+  }
+
+  execute_plan(logical_order, planned.plan, order.order_id);
+  materialize_reports(logical_order, planned.plan, result);
   result.result = OrderBookResult::Accepted;
 
 #ifndef NDEBUG
@@ -95,8 +194,39 @@ OrderBookResult MatchingEngine::validate_new_order(
   return OrderBookResult::Accepted;
 }
 
-MatchingEngine::PlanResult MatchingEngine::plan_new_order(
-    const NewOrder& order) const noexcept {
+OrderBookResult MatchingEngine::validate_cancel_order(
+    const CancelOrder& order) const noexcept {
+  if (!storage_.instrument_id().is_valid() ||
+      order.instrument_id != storage_.instrument_id()) {
+    return OrderBookResult::InvalidInstrument;
+  }
+  if (!order.order_id.is_valid() || !storage_.find_order(order.order_id)) {
+    return OrderBookResult::OrderNotFound;
+  }
+  return OrderBookResult::Accepted;
+}
+
+OrderBookResult MatchingEngine::validate_amend_order(
+    const AmendOrder& order,
+    const std::optional<RestingOrderView>& resting) const noexcept {
+  if (!storage_.instrument_id().is_valid() ||
+      order.instrument_id != storage_.instrument_id()) {
+    return OrderBookResult::InvalidInstrument;
+  }
+  if (!order.order_id.is_valid() || !resting) {
+    return OrderBookResult::OrderNotFound;
+  }
+  if (!order.new_price.is_valid()) {
+    return OrderBookResult::InvalidPrice;
+  }
+  if (!order.new_leaves_quantity.is_valid()) {
+    return OrderBookResult::InvalidAmendment;
+  }
+  return OrderBookResult::Accepted;
+}
+
+MatchingEngine::PlanResult MatchingEngine::plan_order(
+    const LogicalOrder& order) const noexcept {
   PlanResult result;
   result.plan.aggressive_remainder = order.quantity;
   bool fill_capacity_exhausted = false;
@@ -150,28 +280,75 @@ MatchingEngine::PlanResult MatchingEngine::plan_new_order(
 }
 
 OrderBookResult MatchingEngine::preflight_plan(
-    const NewOrder& order, const MatchPlan& plan) const noexcept {
-  if (plan.fully_filled_resting_orders > storage_.active_order_count()) {
+    const LogicalOrder& order, const MatchPlan& plan,
+    const std::optional<RestingOrderView>& replaced_order) const noexcept {
+  const auto replaced_order_count =
+      replaced_order ? std::size_t{1} : std::size_t{0};
+  if (plan.fully_filled_resting_orders + replaced_order_count >
+      storage_.active_order_count()) {
     return OrderBookResult::CapacityExhausted;
   }
   const auto final_active_orders =
-      storage_.active_order_count() - plan.fully_filled_resting_orders +
+      storage_.active_order_count() - plan.fully_filled_resting_orders -
+      replaced_order_count +
       (plan.rest_remainder ? std::size_t{1} : std::size_t{0});
   if (final_active_orders > storage_.active_order_capacity()) {
     return OrderBookResult::CapacityExhausted;
   }
 
   if (plan.rest_remainder) {
-    const auto resting_level = storage_.level(order.side, order.limit_price);
-    if (!resting_level) {
-      if (storage_.price_level_count(order.side) >=
-          storage_.price_level_capacity_per_side()) {
+    auto final_level_count = storage_.price_level_count(order.side);
+    bool old_level_removed = false;
+    if (replaced_order) {
+      const auto old_level =
+          storage_.level(replaced_order->side, replaced_order->price);
+      if (!old_level || old_level->order_count == 0 ||
+          replaced_order->side != order.side) {
         return OrderBookResult::CapacityExhausted;
       }
-    } else if (!checked_add(resting_level->aggregate_leaves_quantity,
-                            plan.aggressive_remainder)
-                    .has_value()) {
+      if (old_level->order_count == 1) {
+        if (final_level_count == 0) {
+          return OrderBookResult::CapacityExhausted;
+        }
+        --final_level_count;
+        old_level_removed = true;
+      }
+    }
+
+    const auto destination_level =
+        storage_.level(order.side, order.limit_price);
+    const bool replacement_is_destination =
+        replaced_order && replaced_order->side == order.side &&
+        replaced_order->price == order.limit_price;
+    const bool destination_exists_after_removal =
+        destination_level && !(replacement_is_destination && old_level_removed);
+
+    if (!destination_exists_after_removal) {
+      ++final_level_count;
+    }
+    if (final_level_count > storage_.price_level_capacity_per_side()) {
       return OrderBookResult::CapacityExhausted;
+    }
+
+    if (destination_exists_after_removal) {
+      Quantity destination_aggregate =
+          destination_level->aggregate_leaves_quantity;
+      if (replacement_is_destination) {
+        const auto without_replaced = checked_subtract(
+            destination_aggregate, replaced_order->leaves_quantity);
+        if (without_replaced.result == QuantityArithmeticResult::Zero) {
+          destination_aggregate = {};
+        } else if (without_replaced.has_value()) {
+          destination_aggregate = without_replaced.value;
+        } else {
+          return OrderBookResult::CapacityExhausted;
+        }
+      }
+      if (destination_aggregate.is_valid() &&
+          !checked_add(destination_aggregate, plan.aggressive_remainder)
+               .has_value()) {
+        return OrderBookResult::CapacityExhausted;
+      }
     }
   }
 
@@ -184,8 +361,15 @@ OrderBookResult MatchingEngine::preflight_plan(
   return OrderBookResult::Accepted;
 }
 
-void MatchingEngine::execute_plan(const NewOrder& order,
-                                  const MatchPlan& plan) {
+void MatchingEngine::execute_plan(
+    const LogicalOrder& order, const MatchPlan& plan,
+    const std::optional<OrderId>& replaced_order_id) {
+  if (replaced_order_id &&
+      storage_.remove_resting(*replaced_order_id) !=
+          OrderBookResult::Accepted) {
+    fail_plan_execution();
+  }
+
   for (std::size_t index = 0; index < plan.fill_count; ++index) {
     const auto& fill = plan.fills[index];
     const auto resting = storage_.find_order(fill.resting_order_id);
@@ -210,7 +394,7 @@ void MatchingEngine::execute_plan(const NewOrder& order,
   }
 }
 
-void MatchingEngine::materialize_reports(const NewOrder& order,
+void MatchingEngine::materialize_reports(const LogicalOrder& order,
                                          const MatchPlan& plan,
                                          NewOrderResult& result) noexcept {
   const auto sequences = sequences_.commit_event_batch(
@@ -236,6 +420,18 @@ void MatchingEngine::materialize_reports(const NewOrder& order,
         fill.resting_order_id, fill.resting_price,  fill.match_quantity,
         engine_sequence.value};
   }
+}
+
+bool MatchingEngine::command_sequence_available() const noexcept {
+  return sequences_.last_command().value() < CommandSequence::maximum_value;
+}
+
+CommandSequence MatchingEngine::accept_command() {
+  const auto assignment = sequences_.accept_command();
+  if (!assignment.assigned()) {
+    fail_plan_execution();
+  }
+  return assignment.sequence;
 }
 
 InstrumentId MatchingEngine::instrument_id() const noexcept {

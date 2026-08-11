@@ -25,6 +25,9 @@ struct NewOrderResult final {
   }
 };
 
+using CancelOrderResult = NewOrderResult;
+using AmendOrderResult = NewOrderResult;
+
 class MatchingEngine final {
  public:
   explicit MatchingEngine(InstrumentId instrument_id,
@@ -37,6 +40,8 @@ class MatchingEngine final {
   ~MatchingEngine() = default;
 
   [[nodiscard]] NewOrderResult process(const NewOrder& order);
+  [[nodiscard]] CancelOrderResult process(const CancelOrder& order);
+  [[nodiscard]] AmendOrderResult process(const AmendOrder& order);
 
   [[nodiscard]] InstrumentId instrument_id() const noexcept;
   [[nodiscard]] CommandSequence last_command_sequence() const noexcept;
@@ -56,6 +61,14 @@ class MatchingEngine final {
   [[nodiscard]] bool validate_invariants() const noexcept;
 
  private:
+  struct LogicalOrder final {
+    OrderId order_id{};
+    InstrumentId instrument_id{};
+    Side side{Side::Invalid};
+    PriceTicks limit_price{};
+    Quantity quantity{};
+  };
+
   struct PlannedFill final {
     OrderId resting_order_id{};
     PriceTicks resting_price{};
@@ -77,12 +90,22 @@ class MatchingEngine final {
 
   [[nodiscard]] OrderBookResult validate_new_order(
       const NewOrder& order) const noexcept;
-  [[nodiscard]] PlanResult plan_new_order(const NewOrder& order) const noexcept;
+  [[nodiscard]] OrderBookResult validate_cancel_order(
+      const CancelOrder& order) const noexcept;
+  [[nodiscard]] OrderBookResult validate_amend_order(
+      const AmendOrder& order,
+      const std::optional<RestingOrderView>& resting) const noexcept;
+  [[nodiscard]] PlanResult plan_order(
+      const LogicalOrder& order) const noexcept;
   [[nodiscard]] OrderBookResult preflight_plan(
-      const NewOrder& order, const MatchPlan& plan) const noexcept;
-  void execute_plan(const NewOrder& order, const MatchPlan& plan);
-  void materialize_reports(const NewOrder& order, const MatchPlan& plan,
+      const LogicalOrder& order, const MatchPlan& plan,
+      const std::optional<RestingOrderView>& replaced_order) const noexcept;
+  void execute_plan(const LogicalOrder& order, const MatchPlan& plan,
+                    const std::optional<OrderId>& replaced_order_id);
+  void materialize_reports(const LogicalOrder& order, const MatchPlan& plan,
                            NewOrderResult& result) noexcept;
+  [[nodiscard]] bool command_sequence_available() const noexcept;
+  [[nodiscard]] CommandSequence accept_command();
 
   OrderBookStorage storage_;
   SequenceState sequences_{};
