@@ -24,7 +24,7 @@ A lower-ranked document must not silently reinterpret a higher-ranked one.
 
 | Phase | Deliverable                                                                                         | Concurrency model                                                           |
 | ----- | --------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| 1     | Correct local matching engine for one instrument per book                                           | Synchronous direct calls; one writer; no sockets or queues.                 |
+| 1     | Correct local matching engine for one instrument per book                                           | Synchronous direct calls; one writer; no sockets or inter-thread queues.    |
 | 2     | Fixed-size object-pool allocator and memory measurements                                            | Still single-writer; no required additional threads.                        |
 | 3     | External outbound multicast market-data feed handler, incremental re-request, and snapshot recovery | Bounded hand-offs and independently owned I/O; no concurrent book mutation. |
 
@@ -76,7 +76,7 @@ external market-data feed handler.
 | ------------------------------ | --------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
 | Local matching engine          | One local matching-book executor and its state                                    | Validate `New`/`Cancel`/`Amend`, match orders, and create execution reports.                                      | Decode packets, perform I/O, or mutate an external book.            |
 | `OrderBookStorage`             | Order-ID index, price-level indexes, FIFO queues, aggregates, and order memory    | Represent local or external book state privately for its owner.                                                   | Expose mutable nodes or accept concurrent access.                   |
-| Lossless execution outbox      | Reserved report slots and system-status control capacity                          | Reserve, commit, and fan out mandatory local output.                                                              | Drop a committed execution report or permit partial output batches. |
+| Lossless execution outbox      | Fixed-capacity execution-report ring and an independent system-status ring        | Reserve and commit mandatory local output; expose only committed records.                                         | Drop or overwrite a committed report, expose a partial batch, or perform downstream work. |
 | UDP ingress and packet decoder | Socket interaction and receive buffers                                            | Receive datagrams; validate framing, lengths, and checksums; produce packet envelopes.                            | Apply messages to a book or decide recovery state.                  |
 | Channel recovery gate          | Per-channel session, expected message sequence, bounded cache, and recovery state | Sequence packets, perform incremental re-request, select snapshot recovery, and release only contiguous messages. | Mutate order nodes directly or block on consumer work.              |
 | Incremental re-request client  | Request transport for a bounded missing message range                             | Request and return retransmitted packets to the recovery gate.                                                    | Decide channel state or apply messages.                             |
@@ -87,7 +87,9 @@ external market-data feed handler.
 ## 6. Local matching path
 
 Phase 1 calls the local matching engine directly from tests or a simple local
-application.  There is no dispatcher or queue requirement at this stage.
+application. There is no dispatcher or inter-thread queue requirement at this
+stage; the owned outboxes are passive bounded storage on the same serial
+executor.
 
 For a mutating command capable of producing lossless output, the engine uses
 this lifecycle:
@@ -95,16 +97,40 @@ this lifecycle:
 1. **Validate** the command, identifier, price, quantity, and instrument state.
 2. **Plan** the fills and the exact mandatory output batch without changing the
    book.
-3. **Reserve** space for every required execution report in the lossless
-   outbox.
+3. **Reserve** exactly one slot for every required execution report in the
+   lossless outbox.
 4. **Execute** the planned order, queue, and aggregate mutations, writing the
    reports into the reserved slots.
 5. **Commit** the batch and advance the engine sequence.
 
-`Commit` is infallible by design because output capacity and all required memory
-were secured before mutation.  If reservation fails, no order mutation occurs;
-the local matching book enters `Halted` and publishes a system-status event
-through separately reserved control capacity.
+`MatchingEngine` owns two `LosslessOutbox<T>` instances: one for
+`ExecutionReport` and a physically independent control outbox for
+`SystemStatus`. `OrderBookStorage` has no outbox reference and remains unaware
+of publication. The default execution and control capacities are 1,024 and 16
+records respectively, and tests may configure smaller powers of two. Both
+rings allocate their complete slot arrays during engine construction. Runtime
+configuration is rejected at startup unless a capacity is non-zero and a
+power of two.
+
+Each ring permits one exact producer reservation at a time. Reserved slots are
+deducted from available capacity but remain invisible to consumption. The
+producer writes only through the reservation and publishes the entire batch by
+one cursor commit; an explicit abort or reservation destruction restores all
+reserved capacity without publication. Read and write cursor advancement uses
+`index & (capacity - 1)`. Occupancy prevents a committed record from being
+overwritten before it is consumed, including across wraparound. A zero-record
+reservation is a valid no-op even when the execution outbox is full.
+
+`Commit` is infallible for a correctly filled reservation because capacity and
+all ring storage were secured before mutation. On execution-outbox reservation
+failure, the accepted order transaction stops without book mutation,
+execution-report publication, `MatchId` assignment, or execution-report
+`EngineSequence` assignment. A second control transaction reserves one status
+slot, changes the instrument from `Active` to `Halted`, and commits one
+`SystemStatus` with the next `EngineSequence`. Existing execution-outbox
+contents remain unchanged. This automatic `LosslessOutboxFull` safety
+transition is the only lifecycle transition in Milestone 5; operator
+halt/resume/close/reset behavior remains Milestone 6.
 
 `OrderBookStorage` is private to the matching engine.  The initial baseline
 uses an order-ID lookup, price-level indexes, and FIFO queues; Phase 2 may
@@ -119,14 +145,13 @@ no mutation or sequence assignment.  Final active-order, price-level,
 aggregate, match-ID, and engine-sequence capacity are checked before the plan
 is executed.
 
-Until Milestone 5 adds the production lossless outbox, `process(NewOrder)`
-returns a bounded synchronous result containing the committed execution
-reports.  Engine sequences and match IDs are assigned only after a fully
-preflighted plan has been applied and before the result becomes observable to
-the caller.  No outbox reservation or fail-closed outbox behavior is modeled
-in Milestone 3.  Milestone 5 inserts `Reserve` between the existing plan and
+Milestone 5 inserts physical reservation between the existing plan and
 execution steps; it does not replace the match plan or introduce a competing
-transaction model.
+transaction model. `process(NewOrder)` and `process(AmendOrder)` retain their
+bounded synchronous report arrays as post-commit mirrors for direct callers,
+but the owned execution outbox is the authoritative publication boundary. A
+caller cannot receive the synchronous success result until the entire planned
+batch has committed to that outbox.
 
 Milestone 4 reuses that same match planner for price-changing amendments by
 describing both a new order and an amended order as one private logical
@@ -136,9 +161,17 @@ accounting logically subtracts the replaced order and any fully filled resting
 orders before adding an amended remainder; only then does execution remove the
 old representation, apply the shared fill plan, and append any remainder.
 Cancel and same-price amendments produce zero reports, while a marketable
-amendment returns its exact bounded report batch through the same synchronous
-result representation.  Physical outbox reservation and publication remain
-deferred to Milestone 5.
+amendment uses the same physical reservation and exact bounded report batch as
+a marketable new order. Non-marketable replacement amendments pass through a
+zero-record reservation and therefore remain valid when execution-report
+capacity is saturated.
+
+One planned fill maps to exactly one `ExecutionReport`, one `MatchId`, and one
+`EngineSequence`. The immutable plan contains at most 256 fills, so the maximum
+execution-outbox batch is exactly 256 records. An outbox with 256 available
+slots accepts that batch exactly; 255 available slots do not. A command whose
+plan would require 257 fills fails planning before reservation and does not
+trigger the outbox-full safety transition.
 
 ## 7. External market-data path
 
@@ -230,6 +263,14 @@ Each independently scheduled consumer needs its own queue or a dedicated
 fan-out mechanism.  A single SPSC queue cannot safely serve multiple consumer
 threads.  The writer never waits for a UI or analytics consumer.
 
+Milestone 5 has no consumer thread or fan-out implementation. Tests and local
+applications synchronously pop committed copies through the matching engine's
+narrow consumption methods. Reservation objects and mutable slots never cross
+the matching-engine boundary. Future consumers may use committed event values
+and their global `EngineSequence`; they must not access private book storage or
+make the matching core aware of sockets, persistence, logging, or consumer
+behavior.
+
 The exact persistence mechanism for the lossless outbox is deferred.  An
 in-memory bounded ring protects the process lifetime; true crash durability
 requires a later write-ahead log or equivalent durable store.
@@ -240,8 +281,9 @@ requires a later write-ahead log or equivalent durable store.
 
 * One thread invokes the local matching engine.
 * The engine is the sole reader and writer of its local book state.
-* Tests call the public API directly; they require no socket, ring buffer, or
-  scheduler.
+* Tests call the public API directly; they require no socket, dispatcher, or
+  scheduler. The matching engine's owned outboxes are passive in-memory
+  storage, not inter-thread queues.
 
 ### 10.2 Phase 3 target
 
