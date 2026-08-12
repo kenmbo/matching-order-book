@@ -2,6 +2,7 @@
 
 #include "lob/domain/contracts.hpp"
 #include "lob/domain/sequencing.hpp"
+#include "lob/egress/lossless_outbox.hpp"
 #include "lob/storage/order_book_storage.hpp"
 
 #include <array>
@@ -13,6 +14,15 @@
 namespace lob {
 
 inline constexpr std::size_t kMaximumFillsPerCommand = std::size_t{1} << 8;
+inline constexpr std::size_t kDefaultExecutionOutboxCapacity =
+    std::size_t{1} << 10;
+inline constexpr std::size_t kDefaultControlOutboxCapacity =
+    std::size_t{1} << 4;
+
+struct LosslessOutboxLimits final {
+  std::size_t execution_reports{kDefaultExecutionOutboxCapacity};
+  std::size_t status_events{kDefaultControlOutboxCapacity};
+};
 
 struct NewOrderResult final {
   OrderBookResult result{OrderBookResult::CapacityExhausted};
@@ -31,7 +41,8 @@ using AmendOrderResult = NewOrderResult;
 class MatchingEngine final {
  public:
   explicit MatchingEngine(InstrumentId instrument_id,
-                          StorageLimits limits = {});
+                          StorageLimits storage_limits = {},
+                          LosslessOutboxLimits outbox_limits = {});
 
   MatchingEngine(const MatchingEngine&) = delete;
   MatchingEngine& operator=(const MatchingEngine&) = delete;
@@ -44,9 +55,19 @@ class MatchingEngine final {
   [[nodiscard]] AmendOrderResult process(const AmendOrder& order);
 
   [[nodiscard]] InstrumentId instrument_id() const noexcept;
+  [[nodiscard]] InstrumentState instrument_state() const noexcept;
   [[nodiscard]] CommandSequence last_command_sequence() const noexcept;
   [[nodiscard]] EngineSequence last_engine_sequence() const noexcept;
   [[nodiscard]] MatchId last_match_id() const noexcept;
+  [[nodiscard]] std::size_t pending_execution_report_count() const noexcept;
+  [[nodiscard]] std::size_t execution_outbox_capacity() const noexcept;
+  [[nodiscard]] std::size_t available_execution_outbox_capacity()
+      const noexcept;
+  [[nodiscard]] bool try_consume_execution_report(
+      ExecutionReport& report) noexcept;
+  [[nodiscard]] std::size_t pending_status_event_count() const noexcept;
+  [[nodiscard]] std::size_t status_outbox_capacity() const noexcept;
+  [[nodiscard]] bool try_consume_status(SystemStatus& status) noexcept;
   [[nodiscard]] std::size_t active_order_count() const noexcept;
   [[nodiscard]] std::size_t price_level_count(Side side) const noexcept;
   [[nodiscard]] std::optional<RestingOrderView> find_order(
@@ -102,16 +123,27 @@ class MatchingEngine final {
       const std::optional<RestingOrderView>& replaced_order) const noexcept;
   void execute_plan(const LogicalOrder& order, const MatchPlan& plan,
                     const std::optional<OrderId>& replaced_order_id);
-  void materialize_reports(const LogicalOrder& order, const MatchPlan& plan,
-                           NewOrderResult& result) noexcept;
+  void commit_reports(
+      const LogicalOrder& order, const MatchPlan& plan,
+      LosslessOutbox<ExecutionReport>::Reservation& reservation,
+      NewOrderResult& result) noexcept;
+  void fail_closed_outbox_full() noexcept;
   [[nodiscard]] bool command_sequence_available() const noexcept;
   [[nodiscard]] CommandSequence accept_command();
 
   OrderBookStorage storage_;
+  LosslessOutbox<ExecutionReport> execution_outbox_;
+  LosslessOutbox<SystemStatus> status_outbox_;
   SequenceState sequences_{};
   MatchId last_match_id_{};
+  InstrumentState instrument_state_{InstrumentState::Active};
 };
 
 static_assert(kMaximumFillsPerCommand == 256);
+static_assert(kDefaultExecutionOutboxCapacity >= kMaximumFillsPerCommand);
+static_assert((kDefaultExecutionOutboxCapacity &
+               (kDefaultExecutionOutboxCapacity - std::size_t{1})) == 0);
+static_assert((kDefaultControlOutboxCapacity &
+               (kDefaultControlOutboxCapacity - std::size_t{1})) == 0);
 
 }  // namespace lob
