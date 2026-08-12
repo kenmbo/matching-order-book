@@ -8,6 +8,15 @@ membership, and aggregate leaves quantities. It performs no crossing,
 matching, command sequencing, publication, lifecycle transition, networking,
 or concurrency work.
 
+Milestone 5 does not change that boundary. `MatchingEngine`, not
+`OrderBookStorage`, owns the fixed-capacity execution and status outboxes. The
+engine reserves output only after immutable matching and final-state storage
+planning succeed, then invokes the existing narrow storage mutations. Storage
+neither sees reservations nor exposes nodes or iterators to publication code.
+An execution-outbox failure therefore occurs before any storage mutation; the
+separate automatic halt changes engine-owned instrument state while preserving
+all storage contents and FIFO priority.
+
 The baseline is correctness-first. It uses standard-library containers:
 
 * an `std::unordered_map` indexes currently active orders by `OrderId`;
@@ -56,6 +65,12 @@ side's price index and each level's FIFO order. `reduce_resting_by` is the
 storage mutation used for a planned fill: it reduces leaves and the aggregate
 in place, or removes the order and empty level when the reduction exactly
 depletes leaves. It does not make crossing or amendment decisions.
+
+Milestone 4 adds narrow quantity-update and FIFO-tail movement primitives.
+They maintain aggregates and private iterator ownership, but the matching
+engine decides whether an amendment retains priority, loses priority, or must
+use the shared matching plan. Repricing continues to use the existing removal
+and insertion primitives only after final-state planning succeeds.
 
 ## Invariant scope
 
