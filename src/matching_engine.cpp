@@ -27,8 +27,12 @@ namespace {
 
 }  // namespace
 
-MatchingEngine::MatchingEngine(InstrumentId instrument_id, StorageLimits limits)
-    : storage_(instrument_id, limits) {}
+MatchingEngine::MatchingEngine(InstrumentId instrument_id,
+                               StorageLimits storage_limits,
+                               LosslessOutboxLimits outbox_limits)
+    : storage_(instrument_id, storage_limits),
+      execution_outbox_(outbox_limits.execution_reports),
+      status_outbox_(outbox_limits.status_events) {}
 
 NewOrderResult MatchingEngine::process(const NewOrder& order) {
   NewOrderResult result;
@@ -62,8 +66,19 @@ NewOrderResult MatchingEngine::process(const NewOrder& order) {
     return result;
   }
 
+  auto reservation = execution_outbox_.reserve(planned.plan.fill_count);
+  if (!reservation.valid()) {
+    result.result = OrderBookResult::LosslessOutboxFull;
+    sequences_.abort_event_batch();
+    fail_closed_outbox_full();
+#ifndef NDEBUG
+    assert(validate_invariants());
+#endif
+    return result;
+  }
+
   execute_plan(logical_order, planned.plan, std::nullopt);
-  materialize_reports(logical_order, planned.plan, result);
+  commit_reports(logical_order, planned.plan, reservation, result);
   result.result = OrderBookResult::Accepted;
 
 #ifndef NDEBUG
@@ -163,8 +178,19 @@ AmendOrderResult MatchingEngine::process(const AmendOrder& order) {
     return result;
   }
 
+  auto reservation = execution_outbox_.reserve(planned.plan.fill_count);
+  if (!reservation.valid()) {
+    result.result = OrderBookResult::LosslessOutboxFull;
+    sequences_.abort_event_batch();
+    fail_closed_outbox_full();
+#ifndef NDEBUG
+    assert(validate_invariants());
+#endif
+    return result;
+  }
+
   execute_plan(logical_order, planned.plan, order.order_id);
-  materialize_reports(logical_order, planned.plan, result);
+  commit_reports(logical_order, planned.plan, reservation, result);
   result.result = OrderBookResult::Accepted;
 
 #ifndef NDEBUG
@@ -178,6 +204,12 @@ OrderBookResult MatchingEngine::validate_new_order(
   if (!storage_.instrument_id().is_valid() ||
       order.instrument_id != storage_.instrument_id()) {
     return OrderBookResult::InvalidInstrument;
+  }
+  if (instrument_state_ == InstrumentState::Halted) {
+    return OrderBookResult::MarketHalted;
+  }
+  if (instrument_state_ != InstrumentState::Active) {
+    return OrderBookResult::InstrumentUnavailable;
   }
   if (!order.order_id.is_valid() || storage_.find_order(order.order_id)) {
     return OrderBookResult::DuplicateOrderId;
@@ -212,6 +244,12 @@ OrderBookResult MatchingEngine::validate_amend_order(
   if (!storage_.instrument_id().is_valid() ||
       order.instrument_id != storage_.instrument_id()) {
     return OrderBookResult::InvalidInstrument;
+  }
+  if (instrument_state_ == InstrumentState::Halted) {
+    return OrderBookResult::MarketHalted;
+  }
+  if (instrument_state_ != InstrumentState::Active) {
+    return OrderBookResult::InstrumentUnavailable;
   }
   if (!order.order_id.is_valid() || !resting) {
     return OrderBookResult::OrderNotFound;
@@ -394,31 +432,86 @@ void MatchingEngine::execute_plan(
   }
 }
 
-void MatchingEngine::materialize_reports(const LogicalOrder& order,
-                                         const MatchPlan& plan,
-                                         NewOrderResult& result) noexcept {
-  const auto sequences = sequences_.commit_event_batch(
-      static_cast<std::uint64_t>(plan.fill_count));
-  if (!sequences.assigned()) {
-    fail_plan_execution();
-  }
-
+void MatchingEngine::commit_reports(
+    const LogicalOrder& order, const MatchPlan& plan,
+    LosslessOutbox<ExecutionReport>::Reservation& reservation,
+    NewOrderResult& result) noexcept {
   result.execution_report_count = plan.fill_count;
   for (std::size_t index = 0; index < plan.fill_count; ++index) {
-    const auto match_id_value = last_match_id_.value() + std::uint64_t{1};
+    const auto offset = static_cast<std::uint64_t>(index) + std::uint64_t{1};
+    const auto match_id_value = last_match_id_.value() + offset;
     const auto match_id = checked_domain_cast<MatchId>(match_id_value);
     const auto engine_sequence = checked_domain_cast<EngineSequence>(
-        sequences.first.value() + static_cast<std::uint64_t>(index));
+        sequences_.last_engine().value() + offset);
     if (!match_id.has_value() || !engine_sequence.has_value()) {
       fail_plan_execution();
     }
-    last_match_id_ = match_id.value;
 
     const auto& fill = plan.fills[index];
-    result.execution_reports[index] = {
-        last_match_id_,       order.instrument_id, order.order_id,
+    const ExecutionReport report{
+        match_id.value,       order.instrument_id, order.order_id,
         fill.resting_order_id, fill.resting_price,  fill.match_quantity,
         engine_sequence.value};
+    result.execution_reports[index] = report;
+    if (!reservation.write(report)) {
+      fail_plan_execution();
+    }
+  }
+
+  const auto event_batch = sequences_.commit_event_batch(
+      static_cast<std::uint64_t>(plan.fill_count));
+  if (!event_batch.assigned()) {
+    fail_plan_execution();
+  }
+  if (plan.fill_count == 0) {
+    if (!event_batch.empty()) {
+      fail_plan_execution();
+    }
+  } else {
+    const auto last_match_id = checked_domain_cast<MatchId>(
+        last_match_id_.value() + static_cast<std::uint64_t>(plan.fill_count));
+    if (!last_match_id.has_value() ||
+        event_batch.first != result.execution_reports[0].engine_sequence ||
+        event_batch.last !=
+            result.execution_reports[plan.fill_count - 1].engine_sequence) {
+      fail_plan_execution();
+    }
+    last_match_id_ = last_match_id.value;
+  }
+
+  if (!reservation.commit()) {
+    fail_plan_execution();
+  }
+}
+
+void MatchingEngine::fail_closed_outbox_full() noexcept {
+  if (instrument_state_ != InstrumentState::Active) {
+    fail_plan_execution();
+  }
+
+  auto reservation = status_outbox_.reserve(1);
+  const auto engine_sequence = checked_domain_cast<EngineSequence>(
+      sequences_.last_engine().value() + std::uint64_t{1});
+  if (!reservation.valid() || !engine_sequence.has_value()) {
+    fail_plan_execution();
+  }
+
+  const SystemStatus status{StatusScope::Instrument,
+                            storage_.instrument_id(),
+                            InstrumentState::Active,
+                            InstrumentState::Halted,
+                            StatusEventKind::StateTransition,
+                            StatusReason::LosslessOutboxFull,
+                            engine_sequence.value};
+  if (!reservation.write(status)) {
+    fail_plan_execution();
+  }
+
+  instrument_state_ = InstrumentState::Halted;
+  const auto event_batch = sequences_.commit_event_batch(1);
+  if (!event_batch.assigned() || event_batch.first != engine_sequence.value ||
+      event_batch.last != engine_sequence.value || !reservation.commit()) {
+    fail_plan_execution();
   }
 }
 
@@ -438,6 +531,10 @@ InstrumentId MatchingEngine::instrument_id() const noexcept {
   return storage_.instrument_id();
 }
 
+InstrumentState MatchingEngine::instrument_state() const noexcept {
+  return instrument_state_;
+}
+
 CommandSequence MatchingEngine::last_command_sequence() const noexcept {
   return sequences_.last_command();
 }
@@ -448,6 +545,36 @@ EngineSequence MatchingEngine::last_engine_sequence() const noexcept {
 
 MatchId MatchingEngine::last_match_id() const noexcept {
   return last_match_id_;
+}
+
+std::size_t MatchingEngine::pending_execution_report_count() const noexcept {
+  return execution_outbox_.size();
+}
+
+std::size_t MatchingEngine::execution_outbox_capacity() const noexcept {
+  return execution_outbox_.capacity();
+}
+
+std::size_t MatchingEngine::available_execution_outbox_capacity()
+    const noexcept {
+  return execution_outbox_.available_capacity();
+}
+
+bool MatchingEngine::try_consume_execution_report(
+    ExecutionReport& report) noexcept {
+  return execution_outbox_.try_pop(report);
+}
+
+std::size_t MatchingEngine::pending_status_event_count() const noexcept {
+  return status_outbox_.size();
+}
+
+std::size_t MatchingEngine::status_outbox_capacity() const noexcept {
+  return status_outbox_.capacity();
+}
+
+bool MatchingEngine::try_consume_status(SystemStatus& status) noexcept {
+  return status_outbox_.try_pop(status);
 }
 
 std::size_t MatchingEngine::active_order_count() const noexcept {
@@ -486,7 +613,11 @@ std::vector<RestingOrderView> MatchingEngine::orders_at_level(
 }
 
 bool MatchingEngine::validate_invariants() const noexcept {
-  if (!storage_.validate_invariants()) {
+  if (!storage_.validate_invariants() ||
+      !execution_outbox_.validate_invariants() ||
+      !status_outbox_.validate_invariants() ||
+      (instrument_state_ != InstrumentState::Active &&
+       instrument_state_ != InstrumentState::Halted)) {
     return false;
   }
   const auto bid = storage_.best_bid();
