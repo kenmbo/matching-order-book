@@ -17,6 +17,8 @@ using lob::DepthEntry;
 using lob::EngineSequence;
 using lob::ExecutionReport;
 using lob::InstrumentId;
+using lob::InstrumentState;
+using lob::LosslessOutboxLimits;
 using lob::MatchId;
 using lob::MatchingEngine;
 using lob::AmendOrder;
@@ -29,7 +31,11 @@ using lob::PriceTicks;
 using lob::Quantity;
 using lob::RestingOrderView;
 using lob::Side;
+using lob::StatusEventKind;
+using lob::StatusReason;
+using lob::StatusScope;
 using lob::StorageLimits;
+using lob::SystemStatus;
 
 class Checks final {
  public:
@@ -121,6 +127,16 @@ bool reports_equal(std::span<const ExecutionReport> left,
     }
   }
   return true;
+}
+
+std::vector<ExecutionReport> drain_reports(MatchingEngine& engine) {
+  std::vector<ExecutionReport> reports;
+  reports.reserve(engine.pending_execution_report_count());
+  ExecutionReport report;
+  while (engine.try_consume_execution_report(report)) {
+    reports.push_back(report);
+  }
+  return reports;
 }
 
 std::vector<OrderId> fifo_ids(const std::vector<RestingOrderView>& orders) {
@@ -896,6 +912,8 @@ void test_marketable_amendment_multi_level_and_remainder(Checks& checks) {
       result.reports()[1], make_domain<MatchId>(checks, std::uint64_t{2}),
       instrument, target, ask_101, price_101, quantity(checks, 10),
       make_domain<EngineSequence>(checks, std::uint64_t{2})));
+  const auto published = drain_reports(engine);
+  checks.require(reports_equal(published, result.reports()));
   checks.require(!engine.find_order(ask_100));
   checks.require(!engine.find_order(ask_101));
   checks.require(engine.find_order(ask_103)->leaves_quantity ==
@@ -938,6 +956,8 @@ void test_marketable_amendment_sell_and_partial_resting_fill(Checks& checks) {
   checks.require(result.reports()[0].resting_order_id == best_bid);
   checks.require(result.reports()[0].match_price == price_100);
   checks.require(result.reports()[0].match_quantity == quantity(checks, 4));
+  const auto published = drain_reports(engine);
+  checks.require(reports_equal(published, result.reports()));
   checks.require(!engine.find_order(target));
   checks.require(engine.find_order(best_bid)->leaves_quantity ==
                  quantity(checks, 6));
@@ -1083,11 +1103,228 @@ void test_cancel_and_amend_validation_is_atomic(Checks& checks) {
   }
 }
 
+void test_execution_outbox_ordering_and_capacity_reuse(Checks& checks) {
+  const auto instrument = instrument_id(checks, 30);
+  const auto level_price = price(checks, 100);
+  const auto one = quantity(checks, 1);
+  MatchingEngine buy_engine(instrument, {}, LosslessOutboxLimits{4, 1});
+  for (std::uint64_t value = 1; value <= 3; ++value) {
+    checks.require(submit(checks, buy_engine, order_id(checks, value),
+                          Side::Sell, level_price, one)
+                       .result == OrderBookResult::Accepted);
+  }
+
+  const auto buy = submit(checks, buy_engine, order_id(checks, 10), Side::Buy,
+                          level_price, quantity(checks, 3));
+  checks.require(buy.result == OrderBookResult::Accepted);
+  checks.require(buy_engine.pending_execution_report_count() == 3);
+  checks.require(buy_engine.available_execution_outbox_capacity() == 1);
+  const auto published_buy = drain_reports(buy_engine);
+  checks.require(reports_equal(published_buy, buy.reports()));
+  checks.require(buy_engine.pending_execution_report_count() == 0);
+  checks.require(buy_engine.available_execution_outbox_capacity() == 4);
+
+  checks.require(submit(checks, buy_engine, order_id(checks, 11), Side::Sell,
+                        level_price, one)
+                     .result == OrderBookResult::Accepted);
+  const auto reused = submit(checks, buy_engine, order_id(checks, 12),
+                             Side::Buy, level_price, one);
+  checks.require(reused.result == OrderBookResult::Accepted);
+  checks.require(reused.reports().size() == 1);
+  const auto reused_published = drain_reports(buy_engine);
+  checks.require(reports_equal(reused_published, reused.reports()));
+  checks.require(reused_published[0].engine_sequence.value() == 4);
+  checks.require(reused_published[0].match_id.value() == 4);
+
+  MatchingEngine sell_engine(instrument, {}, LosslessOutboxLimits{4, 1});
+  for (std::uint64_t value = 1; value <= 3; ++value) {
+    checks.require(submit(checks, sell_engine, order_id(checks, 100 + value),
+                          Side::Buy, level_price, one)
+                       .result == OrderBookResult::Accepted);
+  }
+  const auto sell = submit(checks, sell_engine, order_id(checks, 200),
+                           Side::Sell, level_price, quantity(checks, 3));
+  const auto published_sell = drain_reports(sell_engine);
+  checks.require(sell.result == OrderBookResult::Accepted);
+  checks.require(reports_equal(published_sell, sell.reports()));
+  for (std::size_t index = 0; index < published_sell.size(); ++index) {
+    checks.require(published_sell[index].resting_order_id.value() ==
+                   std::uint64_t{101} + static_cast<std::uint64_t>(index));
+    checks.require(published_sell[index].engine_sequence.value() ==
+                   std::uint64_t{1} + static_cast<std::uint64_t>(index));
+    checks.require(published_sell[index].match_id.value() ==
+                   std::uint64_t{1} + static_cast<std::uint64_t>(index));
+  }
+}
+
+void test_zero_output_commands_ignore_full_execution_outbox(Checks& checks) {
+  const auto instrument = instrument_id(checks, 31);
+  const auto ask_price = price(checks, 100);
+  const auto bid_price = price(checks, 90);
+  const auto target = order_id(checks, 10);
+  MatchingEngine engine(instrument, {}, LosslessOutboxLimits{1, 1});
+
+  checks.require(submit(checks, engine, order_id(checks, 1), Side::Sell,
+                        ask_price, quantity(checks, 1))
+                     .result == OrderBookResult::Accepted);
+  checks.require(submit(checks, engine, order_id(checks, 2), Side::Buy,
+                        ask_price, quantity(checks, 1))
+                     .result == OrderBookResult::Accepted);
+  checks.require(engine.pending_execution_report_count() == 1);
+  checks.require(engine.available_execution_outbox_capacity() == 0);
+
+  const auto resting = submit(checks, engine, target, Side::Buy, bid_price,
+                              quantity(checks, 5));
+  const auto noop = amend(checks, engine, target, bid_price,
+                          quantity(checks, 5));
+  const auto reduction = amend(checks, engine, target, bid_price,
+                               quantity(checks, 4));
+  const auto increase = amend(checks, engine, target, bid_price,
+                              quantity(checks, 6));
+  const auto reprice = amend(checks, engine, target, price(checks, 91),
+                             quantity(checks, 6));
+  const auto cancelled = cancel(checks, engine, target);
+
+  for (const auto* outcome :
+       {&resting, &noop, &reduction, &increase, &reprice, &cancelled}) {
+    checks.require(outcome->result == OrderBookResult::Accepted);
+    checks.require(outcome->reports().empty());
+  }
+  checks.require(!engine.find_order(target));
+  checks.require(engine.instrument_state() == InstrumentState::Active);
+  checks.require(engine.pending_execution_report_count() == 1);
+  checks.require(engine.pending_status_event_count() == 0);
+  checks.require(engine.last_engine_sequence().value() == 1);
+  checks.require(engine.last_match_id().value() == 1);
+}
+
+void test_new_order_outbox_failure_is_atomic_and_halts(Checks& checks) {
+  const auto instrument = instrument_id(checks, 32);
+  const auto level_price = price(checks, 100);
+  const auto one = quantity(checks, 1);
+  const auto failed_order = order_id(checks, 20);
+  MatchingEngine engine(instrument, {}, LosslessOutboxLimits{2, 1});
+
+  for (std::uint64_t value = 1; value <= 3; ++value) {
+    checks.require(submit(checks, engine, order_id(checks, value), Side::Sell,
+                          level_price, one)
+                       .result == OrderBookResult::Accepted);
+  }
+  const auto warmup = submit(checks, engine, order_id(checks, 10), Side::Buy,
+                             level_price, one);
+  checks.require(warmup.result == OrderBookResult::Accepted);
+  checks.require(warmup.reports().size() == 1);
+  checks.require(engine.pending_execution_report_count() == 1);
+
+  const auto before = logical_state(engine);
+  const auto command_before = engine.last_command_sequence();
+  const auto engine_before = engine.last_engine_sequence();
+  const auto match_before = engine.last_match_id();
+  const auto failure = submit(checks, engine, failed_order, Side::Buy,
+                              level_price, quantity(checks, 2));
+
+  checks.require(failure.result == OrderBookResult::LosslessOutboxFull);
+  checks.require(failure.command_sequence.value() ==
+                 command_before.value() + 1);
+  checks.require(failure.reports().empty());
+  checks.require(logical_state(engine) == before);
+  checks.require(!engine.find_order(failed_order));
+  checks.require(engine.last_match_id() == match_before);
+  checks.require(engine.last_engine_sequence().value() ==
+                 engine_before.value() + 1);
+  checks.require(engine.instrument_state() == InstrumentState::Halted);
+  checks.require(engine.pending_execution_report_count() == 1);
+  checks.require(engine.pending_status_event_count() == 1);
+
+  const auto unchanged_reports = drain_reports(engine);
+  checks.require(reports_equal(unchanged_reports, warmup.reports()));
+
+  SystemStatus status;
+  checks.require(engine.try_consume_status(status));
+  checks.require(status.scope == StatusScope::Instrument);
+  checks.require(status.instrument_id == instrument);
+  checks.require(status.previous_state == InstrumentState::Active);
+  checks.require(status.resulting_state == InstrumentState::Halted);
+  checks.require(status.kind == StatusEventKind::StateTransition);
+  checks.require(status.reason == StatusReason::LosslessOutboxFull);
+  checks.require(status.engine_sequence == engine.last_engine_sequence());
+  checks.require(!engine.try_consume_status(status));
+
+  const auto command_after_halt = engine.last_command_sequence();
+  const auto rejected = engine.process(NewOrder{
+      order_id(checks, 21), instrument, Side::Buy, level_price, one});
+  checks.require(rejected.result == OrderBookResult::MarketHalted);
+  checks.require(engine.last_command_sequence() == command_after_halt);
+
+  const auto cancel_while_halted = cancel(checks, engine, order_id(checks, 2));
+  checks.require(cancel_while_halted.result == OrderBookResult::Accepted);
+  checks.require(engine.instrument_state() == InstrumentState::Halted);
+}
+
+void test_amend_outbox_failure_is_atomic_and_halts(Checks& checks) {
+  const auto instrument = instrument_id(checks, 33);
+  const auto target = order_id(checks, 10);
+  const auto sibling = order_id(checks, 11);
+  const auto resting_ask = order_id(checks, 12);
+  const auto old_price = price(checks, 90);
+  const auto crossing_price = price(checks, 100);
+  MatchingEngine engine(instrument, {}, LosslessOutboxLimits{1, 1});
+
+  checks.require(submit(checks, engine, order_id(checks, 1), Side::Sell,
+                        crossing_price, quantity(checks, 1))
+                     .result == OrderBookResult::Accepted);
+  const auto warmup = submit(checks, engine, order_id(checks, 2), Side::Buy,
+                             crossing_price, quantity(checks, 1));
+  checks.require(warmup.result == OrderBookResult::Accepted);
+  checks.require(submit(checks, engine, target, Side::Buy, old_price,
+                        quantity(checks, 4))
+                     .result == OrderBookResult::Accepted);
+  checks.require(submit(checks, engine, sibling, Side::Buy, old_price,
+                        quantity(checks, 2))
+                     .result == OrderBookResult::Accepted);
+  checks.require(submit(checks, engine, resting_ask, Side::Sell,
+                        crossing_price, quantity(checks, 4))
+                     .result == OrderBookResult::Accepted);
+
+  const auto before = logical_state(engine);
+  const auto command_before = engine.last_command_sequence();
+  const auto engine_before = engine.last_engine_sequence();
+  const auto match_before = engine.last_match_id();
+  const auto failure = amend(checks, engine, target, crossing_price,
+                             quantity(checks, 4));
+
+  checks.require(failure.result == OrderBookResult::LosslessOutboxFull);
+  checks.require(failure.command_sequence.value() ==
+                 command_before.value() + 1);
+  checks.require(failure.reports().empty());
+  checks.require(logical_state(engine) == before);
+  checks.require(engine.find_order(target)->price == old_price);
+  checks.require(engine.find_order(target)->leaves_quantity ==
+                 quantity(checks, 4));
+  checks.require(fifo_ids(engine.orders_at_level(Side::Buy, old_price)) ==
+                 std::vector<OrderId>{target, sibling});
+  checks.require(engine.find_order(resting_ask)->leaves_quantity ==
+                 quantity(checks, 4));
+  checks.require(engine.last_match_id() == match_before);
+  checks.require(engine.last_engine_sequence().value() ==
+                 engine_before.value() + 1);
+  checks.require(engine.instrument_state() == InstrumentState::Halted);
+  checks.require(engine.pending_execution_report_count() == 1);
+  checks.require(engine.pending_status_event_count() == 1);
+
+  const auto unchanged_reports = drain_reports(engine);
+  checks.require(reports_equal(unchanged_reports, warmup.reports()));
+  SystemStatus status;
+  checks.require(engine.try_consume_status(status));
+  checks.require(status.reason == StatusReason::LosslessOutboxFull);
+  checks.require(status.engine_sequence == engine.last_engine_sequence());
+}
+
 void test_fill_capacity_boundary(Checks& checks) {
   const auto instrument = instrument_id(checks, 13);
   const auto ask_price = price(checks, 100);
   const auto one = quantity(checks, 1);
-  MatchingEngine permitted(instrument);
+  MatchingEngine permitted(instrument, {}, LosslessOutboxLimits{256, 1});
   for (std::uint64_t value = 1; value <= 256; ++value) {
     checks.require(submit(checks, permitted, order_id(checks, value),
                           Side::Sell, ask_price, one)
@@ -1139,7 +1376,7 @@ void test_amend_fill_capacity_boundary(Checks& checks) {
   const auto crossing_price = price(checks, 100);
   const auto one = quantity(checks, 1);
 
-  MatchingEngine permitted(instrument);
+  MatchingEngine permitted(instrument, {}, LosslessOutboxLimits{256, 1});
   const auto permitted_target = order_id(checks, 1);
   checks.require(submit(checks, permitted, permitted_target, Side::Buy,
                         old_price, quantity(checks, 256))
@@ -1338,6 +1575,10 @@ int main() {
   test_marketable_amendment_fifo_sweep(checks);
   test_invalid_commands_are_atomic(checks);
   test_cancel_and_amend_validation_is_atomic(checks);
+  test_execution_outbox_ordering_and_capacity_reuse(checks);
+  test_zero_output_commands_ignore_full_execution_outbox(checks);
+  test_new_order_outbox_failure_is_atomic_and_halts(checks);
+  test_amend_outbox_failure_is_atomic_and_halts(checks);
   test_fill_capacity_boundary(checks);
   test_amend_fill_capacity_boundary(checks);
   test_final_state_capacity_preflight(checks);
