@@ -12,12 +12,15 @@ using lob::AmendOrder;
 using lob::CancelOrder;
 using lob::CommandKind;
 using lob::CommandSequence;
+using lob::CloseInstrument;
 using lob::EngineSequence;
 using lob::ExecutionReport;
 using lob::InstrumentId;
 using lob::InstrumentState;
+using lob::HaltInstrument;
 using lob::MatchId;
 using lob::NewOrder;
+using lob::OpenInstrument;
 using lob::OrderBookResult;
 using lob::OrderId;
 using lob::PriceTicks;
@@ -25,6 +28,7 @@ using lob::Quantity;
 using lob::SequenceAllocationResult;
 using lob::SequenceState;
 using lob::Side;
+using lob::ResumeInstrument;
 using lob::StatusEventKind;
 using lob::StatusReason;
 using lob::StatusScope;
@@ -50,6 +54,14 @@ static_assert(std::is_trivially_copyable_v<CancelOrder>);
 static_assert(std::is_standard_layout_v<CancelOrder>);
 static_assert(std::is_trivially_copyable_v<AmendOrder>);
 static_assert(std::is_standard_layout_v<AmendOrder>);
+static_assert(std::is_trivially_copyable_v<HaltInstrument>);
+static_assert(std::is_standard_layout_v<HaltInstrument>);
+static_assert(std::is_trivially_copyable_v<ResumeInstrument>);
+static_assert(std::is_standard_layout_v<ResumeInstrument>);
+static_assert(std::is_trivially_copyable_v<CloseInstrument>);
+static_assert(std::is_standard_layout_v<CloseInstrument>);
+static_assert(std::is_trivially_copyable_v<OpenInstrument>);
+static_assert(std::is_standard_layout_v<OpenInstrument>);
 static_assert(std::is_trivially_copyable_v<ExecutionReport>);
 static_assert(std::is_standard_layout_v<ExecutionReport>);
 static_assert(std::is_trivially_copyable_v<SystemStatus>);
@@ -162,6 +174,8 @@ void test_enums(Checks& checks) noexcept {
       OrderBookResult::LosslessOutboxFull,
       OrderBookResult::ChannelUnavailable,
       OrderBookResult::SnapshotRequired,
+      OrderBookResult::InvalidStateTransition,
+      OrderBookResult::StatusOutboxFull,
   };
 
   for (std::size_t left = 0; left < required_results.size(); ++left) {
@@ -175,6 +189,10 @@ void test_enums(Checks& checks) noexcept {
   checks.require(static_cast<std::uint8_t>(CommandKind::New) == 1);
   checks.require(static_cast<std::uint8_t>(CommandKind::Cancel) == 2);
   checks.require(static_cast<std::uint8_t>(CommandKind::Amend) == 3);
+  checks.require(static_cast<std::uint8_t>(CommandKind::Halt) == 4);
+  checks.require(static_cast<std::uint8_t>(CommandKind::Resume) == 5);
+  checks.require(static_cast<std::uint8_t>(CommandKind::Close) == 6);
+  checks.require(static_cast<std::uint8_t>(CommandKind::Open) == 7);
   checks.require(static_cast<std::uint8_t>(InstrumentState::Active) == 1);
   checks.require(static_cast<std::uint8_t>(InstrumentState::Halted) == 2);
   checks.require(static_cast<std::uint8_t>(InstrumentState::Closed) == 3);
@@ -192,6 +210,10 @@ void test_commands_and_events(Checks& checks) noexcept {
   const NewOrder new_order{order, instrument, Side::Buy, price, quantity};
   const CancelOrder cancel{order, instrument};
   const AmendOrder amend{order, instrument, price, quantity};
+  const HaltInstrument halt{instrument};
+  const ResumeInstrument resume{instrument};
+  const CloseInstrument close{instrument};
+  const OpenInstrument open{instrument};
   checks.require(new_order.order_id == order &&
                  new_order.instrument_id == instrument &&
                  new_order.side == Side::Buy &&
@@ -201,6 +223,11 @@ void test_commands_and_events(Checks& checks) noexcept {
   checks.require(amend.order_id == order && amend.instrument_id == instrument &&
                  amend.new_price == price &&
                  amend.new_leaves_quantity == quantity);
+  checks.require(halt.instrument_id == instrument &&
+                 resume.instrument_id == instrument &&
+                 close.instrument_id == instrument &&
+                 open.instrument_id == instrument);
+  checks.require(static_cast<std::uint8_t>(StatusReason::SessionOpen) == 5);
 
   const ExecutionReport report{match, instrument, order, resting, price, quantity,
                                engine};
