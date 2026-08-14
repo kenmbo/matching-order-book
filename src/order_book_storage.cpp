@@ -272,6 +272,12 @@ OrderBookResult OrderBookStorage::move_resting_to_back(
   return OrderBookResult::OrderNotFound;
 }
 
+void OrderBookStorage::clear() noexcept {
+  orders_.clear();
+  bids_.clear();
+  asks_.clear();
+}
+
 OrderBookResult OrderBookStorage::remove_bid(
     OrderIndex::iterator indexed_order) {
   const auto level = bids_.find(indexed_order->second.price);
