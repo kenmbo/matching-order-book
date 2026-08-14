@@ -18,6 +18,10 @@ enum class CommandKind : std::uint8_t {
   New = 1,
   Cancel = 2,
   Amend = 3,
+  Halt = 4,
+  Resume = 5,
+  Close = 6,
+  Open = 7,
 };
 
 enum class InstrumentState : std::uint8_t {
@@ -42,6 +46,8 @@ enum class OrderBookResult : std::uint8_t {
   LosslessOutboxFull = 11,
   ChannelUnavailable = 12,
   SnapshotRequired = 13,
+  InvalidStateTransition = 14,
+  StatusOutboxFull = 15,
 };
 
 enum class StatusScope : std::uint8_t {
@@ -62,6 +68,7 @@ enum class StatusReason : std::uint8_t {
   TradingResume = 2,
   EndOfDay = 3,
   LosslessOutboxFull = 4,
+  SessionOpen = 5,
 };
 
 struct NewOrder final {
@@ -82,6 +89,22 @@ struct AmendOrder final {
   InstrumentId instrument_id{};
   PriceTicks new_price{};
   Quantity new_leaves_quantity{};
+};
+
+struct HaltInstrument final {
+  InstrumentId instrument_id{};
+};
+
+struct ResumeInstrument final {
+  InstrumentId instrument_id{};
+};
+
+struct CloseInstrument final {
+  InstrumentId instrument_id{};
+};
+
+struct OpenInstrument final {
+  InstrumentId instrument_id{};
 };
 
 struct ExecutionReport final {
@@ -121,11 +144,19 @@ static_assert(sizeof(std::underlying_type_t<StatusReason>) ==
 static_assert(std::is_trivially_copyable_v<NewOrder>);
 static_assert(std::is_trivially_copyable_v<CancelOrder>);
 static_assert(std::is_trivially_copyable_v<AmendOrder>);
+static_assert(std::is_trivially_copyable_v<HaltInstrument>);
+static_assert(std::is_trivially_copyable_v<ResumeInstrument>);
+static_assert(std::is_trivially_copyable_v<CloseInstrument>);
+static_assert(std::is_trivially_copyable_v<OpenInstrument>);
 static_assert(std::is_trivially_copyable_v<ExecutionReport>);
 static_assert(std::is_trivially_copyable_v<SystemStatus>);
 static_assert(std::is_standard_layout_v<NewOrder>);
 static_assert(std::is_standard_layout_v<CancelOrder>);
 static_assert(std::is_standard_layout_v<AmendOrder>);
+static_assert(std::is_standard_layout_v<HaltInstrument>);
+static_assert(std::is_standard_layout_v<ResumeInstrument>);
+static_assert(std::is_standard_layout_v<CloseInstrument>);
+static_assert(std::is_standard_layout_v<OpenInstrument>);
 static_assert(std::is_standard_layout_v<ExecutionReport>);
 static_assert(std::is_standard_layout_v<SystemStatus>);
 
