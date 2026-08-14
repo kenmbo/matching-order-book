@@ -74,7 +74,7 @@ external market-data feed handler.
 
 | Component                      | Owns                                                                              | Responsibilities                                                                                                  | Must not do                                                         |
 | ------------------------------ | --------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| Local matching engine          | One local matching-book executor and its state                                    | Validate `New`/`Cancel`/`Amend`, match orders, and create execution reports.                                      | Decode packets, perform I/O, or mutate an external book.            |
+| Local matching engine          | One local matching-book executor, lifecycle state, and local outboxes             | Gate normalized order/lifecycle commands, match orders, reset at close, and publish local events.                  | Decode packets, perform I/O, or mutate an external book.            |
 | `OrderBookStorage`             | Order-ID index, price-level indexes, FIFO queues, aggregates, and order memory    | Represent local or external book state privately for its owner.                                                   | Expose mutable nodes or accept concurrent access.                   |
 | Lossless execution outbox      | Fixed-capacity execution-report ring and an independent system-status ring        | Reserve and commit mandatory local output; expose only committed records.                                         | Drop or overwrite a committed report, expose a partial batch, or perform downstream work. |
 | UDP ingress and packet decoder | Socket interaction and receive buffers                                            | Receive datagrams; validate framing, lengths, and checksums; produce packet envelopes.                            | Apply messages to a book or decide recovery state.                  |
@@ -110,7 +110,7 @@ of publication. The default execution and control capacities are 1,024 and 16
 records respectively, and tests may configure smaller powers of two. Both
 rings allocate their complete slot arrays during engine construction. Runtime
 configuration is rejected at startup unless a capacity is non-zero and a
-power of two.
+power of two; status capacity must additionally be at least two.
 
 Each ring permits one exact producer reservation at a time. Reserved slots are
 deducted from available capacity but remain invisible to consumption. The
@@ -129,8 +129,28 @@ execution-report publication, `MatchId` assignment, or execution-report
 slot, changes the instrument from `Active` to `Halted`, and commits one
 `SystemStatus` with the next `EngineSequence`. Existing execution-outbox
 contents remain unchanged. This automatic `LosslessOutboxFull` safety
-transition is the only lifecycle transition in Milestone 5; operator
-halt/resume/close/reset behavior remains Milestone 6.
+transition was the only lifecycle transition delivered in Milestone 5;
+Milestone 6 integrates it with operator halt, resume, close, and open.
+
+Milestone 6 makes lifecycle control an explicit matching-engine boundary, not
+a storage or consumer responsibility. The public normalized controls are
+`HaltInstrument`, `ResumeInstrument`, `CloseInstrument`, and `OpenInstrument`.
+The engine alone owns the `Active`, `Halted`, and `Closed` state, validates the
+transition matrix, gates order commands, reserves status publication, and then
+applies a transition. `OrderBookStorage` only performs the requested clear for
+a successfully preflighted close.
+
+| Current state | Halt | Resume | Close | Open |
+| --- | --- | --- | --- | --- |
+| `Active` | `Halted` | Reject | `Closed` | Reject |
+| `Halted` | Reject | `Active` | `Closed` | Reject |
+| `Closed` | Reject | Reject | Reject | `Active` |
+
+Invalid pairs return `InvalidStateTransition` before command acceptance.
+Successful halt and resume preserve storage and FIFO priority. Close is the
+only destructive local transition and empties the book. Open begins a new
+empty session without resetting sequence, match-ID, diagnostic, or committed
+outbox state.
 
 `OrderBookStorage` is private to the matching engine.  The initial baseline
 uses an order-ID lookup, price-level indexes, and FIFO queues; Phase 2 may
@@ -172,6 +192,31 @@ execution-outbox batch is exactly 256 records. An outbox with 256 available
 slots accepts that batch exactly; 255 available slots do not. A command whose
 plan would require 257 fills fails planning before reservation and does not
 trigger the outbox-full safety transition.
+
+### 6.1 Lifecycle control transaction
+
+A valid lifecycle command follows `Validate -> Accept -> Preflight -> Reserve
+-> Transition/Reset -> Commit`. Acceptance consumes one `CommandSequence`.
+Preflight requires one status slot and one engine sequence; failure afterward
+retains the command sequence but changes no state or book contents and
+publishes nothing. `StatusOutboxFull` identifies ordinary control saturation,
+while `CapacityExhausted` identifies engine-sequence exhaustion. Lifecycle
+commands never consume `MatchId`.
+
+The status outbox has power-of-two capacity of at least two. Resume and open
+may reserve only when at least two slots are available, leaving one safety slot
+after the instrument becomes active. Operator halt, automatic
+`LosslessOutboxFull` halt, and close may use the final slot because their
+resulting state is non-active. Thus an active engine always retains capacity
+for its mandatory automatic halt; no physical slot is permanently tied to a
+particular command.
+
+The producer writes the complete `SystemStatus` before changing state, but the
+record remains invisible in its reservation. After successful preflight,
+state transition, optional storage clear, sequence commit, and publication are
+infallible invariants. Halt/resume/open publish `StateTransition`; close
+publishes `Reset`. Reasons distinguish `TradingHalt`, `TradingResume`,
+`EndOfDay`, `SessionOpen`, and the automatic `LosslessOutboxFull` halt.
 
 ## 7. External market-data path
 
@@ -306,6 +351,9 @@ thread layout benefits from it.
   codes and leave book data unchanged on ordinary rejection.
 * Lossless output-capacity failure is a fail-closed state transition, not an
   accepted partial match.
+* Ordinary lifecycle status saturation returns `StatusOutboxFull` after command
+  acceptance but before state mutation; the protected headroom rule keeps the
+  emergency halt publishable whenever the instrument is active.
 * Malformed market-data packets are logged, never applied, and trigger channel
   snapshot recovery.
 * Recovery, resets, lossless-outbox faults, and status changes emit bounded,
