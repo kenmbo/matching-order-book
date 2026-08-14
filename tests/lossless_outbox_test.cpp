@@ -1,4 +1,5 @@
 #include "lob/egress/lossless_outbox.hpp"
+#include "lob/domain/contracts.hpp"
 
 #include <array>
 #include <cstddef>
@@ -164,6 +165,37 @@ void test_abort_and_abandon_restore_capacity(Checks& checks) {
   checks.require(outbox.validate_invariants());
 }
 
+void test_system_status_invisible_until_commit(Checks& checks) {
+  lob::LosslessOutbox<lob::SystemStatus> outbox(2);
+  const auto instrument =
+      lob::checked_domain_cast<lob::InstrumentId>(std::uint32_t{7});
+  const auto sequence =
+      lob::checked_domain_cast<lob::EngineSequence>(std::uint64_t{1});
+  checks.require(instrument.has_value() && sequence.has_value());
+  const lob::SystemStatus expected{lob::StatusScope::Instrument,
+                                   instrument.value,
+                                   lob::InstrumentState::Active,
+                                   lob::InstrumentState::Halted,
+                                   lob::StatusEventKind::StateTransition,
+                                   lob::StatusReason::TradingHalt,
+                                   sequence.value};
+  auto reservation = outbox.reserve(1);
+  checks.require(reservation.valid() && reservation.write(expected));
+
+  lob::SystemStatus observed;
+  checks.require(!outbox.try_peek(observed));
+  checks.require(!outbox.try_pop(observed));
+  checks.require(reservation.commit());
+  checks.require(outbox.try_pop(observed));
+  checks.require(observed.scope == expected.scope &&
+                 observed.instrument_id == expected.instrument_id &&
+                 observed.previous_state == expected.previous_state &&
+                 observed.resulting_state == expected.resulting_state &&
+                 observed.kind == expected.kind &&
+                 observed.reason == expected.reason &&
+                 observed.engine_sequence == expected.engine_sequence);
+}
+
 }  // namespace
 
 int main() {
@@ -173,5 +205,6 @@ int main() {
   test_exact_capacity_and_insufficient_by_one(checks);
   test_partial_occupancy_wraparound_and_reuse(checks);
   test_abort_and_abandon_restore_capacity(checks);
+  test_system_status_invisible_until_commit(checks);
   return checks.passed() ? 0 : 1;
 }
