@@ -18,6 +18,7 @@ inline constexpr std::size_t kDefaultExecutionOutboxCapacity =
     std::size_t{1} << 10;
 inline constexpr std::size_t kDefaultControlOutboxCapacity =
     std::size_t{1} << 4;
+inline constexpr std::size_t kMinimumStatusOutboxCapacity = 2;
 
 struct LosslessOutboxLimits final {
   std::size_t execution_reports{kDefaultExecutionOutboxCapacity};
@@ -38,6 +39,11 @@ struct NewOrderResult final {
 using CancelOrderResult = NewOrderResult;
 using AmendOrderResult = NewOrderResult;
 
+struct LifecycleCommandResult final {
+  OrderBookResult result{OrderBookResult::CapacityExhausted};
+  CommandSequence command_sequence{};
+};
+
 class MatchingEngine final {
  public:
   explicit MatchingEngine(InstrumentId instrument_id,
@@ -53,6 +59,14 @@ class MatchingEngine final {
   [[nodiscard]] NewOrderResult process(const NewOrder& order);
   [[nodiscard]] CancelOrderResult process(const CancelOrder& order);
   [[nodiscard]] AmendOrderResult process(const AmendOrder& order);
+  [[nodiscard]] LifecycleCommandResult process(
+      const HaltInstrument& command) noexcept;
+  [[nodiscard]] LifecycleCommandResult process(
+      const ResumeInstrument& command) noexcept;
+  [[nodiscard]] LifecycleCommandResult process(
+      const CloseInstrument& command) noexcept;
+  [[nodiscard]] LifecycleCommandResult process(
+      const OpenInstrument& command) noexcept;
 
   [[nodiscard]] InstrumentId instrument_id() const noexcept;
   [[nodiscard]] InstrumentState instrument_state() const noexcept;
@@ -67,6 +81,7 @@ class MatchingEngine final {
       ExecutionReport& report) noexcept;
   [[nodiscard]] std::size_t pending_status_event_count() const noexcept;
   [[nodiscard]] std::size_t status_outbox_capacity() const noexcept;
+  [[nodiscard]] std::size_t available_status_outbox_capacity() const noexcept;
   [[nodiscard]] bool try_consume_status(SystemStatus& status) noexcept;
   [[nodiscard]] std::size_t active_order_count() const noexcept;
   [[nodiscard]] std::size_t price_level_count(Side side) const noexcept;
@@ -127,9 +142,19 @@ class MatchingEngine final {
       const LogicalOrder& order, const MatchPlan& plan,
       LosslessOutbox<ExecutionReport>::Reservation& reservation,
       NewOrderResult& result) noexcept;
+  [[nodiscard]] LifecycleCommandResult reject_lifecycle(
+      OrderBookResult result) const noexcept;
+  [[nodiscard]] LifecycleCommandResult execute_lifecycle(
+      InstrumentState resulting_state, StatusEventKind event_kind,
+      StatusReason reason, bool reset_book,
+      bool preserve_safety_headroom) noexcept;
+  [[nodiscard]] OrderBookResult commit_lifecycle_transition(
+      InstrumentState resulting_state, StatusEventKind event_kind,
+      StatusReason reason, bool reset_book,
+      bool preserve_safety_headroom) noexcept;
   void fail_closed_outbox_full() noexcept;
   [[nodiscard]] bool command_sequence_available() const noexcept;
-  [[nodiscard]] CommandSequence accept_command();
+  [[nodiscard]] CommandSequence accept_command() noexcept;
 
   OrderBookStorage storage_;
   LosslessOutbox<ExecutionReport> execution_outbox_;
@@ -141,6 +166,7 @@ class MatchingEngine final {
 
 static_assert(kMaximumFillsPerCommand == 256);
 static_assert(kDefaultExecutionOutboxCapacity >= kMaximumFillsPerCommand);
+static_assert(kDefaultControlOutboxCapacity >= kMinimumStatusOutboxCapacity);
 static_assert((kDefaultExecutionOutboxCapacity &
                (kDefaultExecutionOutboxCapacity - std::size_t{1})) == 0);
 static_assert((kDefaultControlOutboxCapacity &

@@ -25,6 +25,14 @@ namespace {
   std::abort();
 }
 
+[[nodiscard]] std::size_t validate_status_outbox_capacity(
+    std::size_t capacity) noexcept {
+  if (capacity < kMinimumStatusOutboxCapacity) {
+    std::abort();
+  }
+  return capacity;
+}
+
 }  // namespace
 
 MatchingEngine::MatchingEngine(InstrumentId instrument_id,
@@ -32,7 +40,8 @@ MatchingEngine::MatchingEngine(InstrumentId instrument_id,
                                LosslessOutboxLimits outbox_limits)
     : storage_(instrument_id, storage_limits),
       execution_outbox_(outbox_limits.execution_reports),
-      status_outbox_(outbox_limits.status_events) {}
+      status_outbox_(
+          validate_status_outbox_capacity(outbox_limits.status_events)) {}
 
 NewOrderResult MatchingEngine::process(const NewOrder& order) {
   NewOrderResult result;
@@ -199,6 +208,62 @@ AmendOrderResult MatchingEngine::process(const AmendOrder& order) {
   return result;
 }
 
+LifecycleCommandResult MatchingEngine::process(
+    const HaltInstrument& command) noexcept {
+  if (!storage_.instrument_id().is_valid() ||
+      command.instrument_id != storage_.instrument_id()) {
+    return reject_lifecycle(OrderBookResult::InvalidInstrument);
+  }
+  if (instrument_state_ != InstrumentState::Active) {
+    return reject_lifecycle(OrderBookResult::InvalidStateTransition);
+  }
+  return execute_lifecycle(InstrumentState::Halted,
+                           StatusEventKind::StateTransition,
+                           StatusReason::TradingHalt, false, false);
+}
+
+LifecycleCommandResult MatchingEngine::process(
+    const ResumeInstrument& command) noexcept {
+  if (!storage_.instrument_id().is_valid() ||
+      command.instrument_id != storage_.instrument_id()) {
+    return reject_lifecycle(OrderBookResult::InvalidInstrument);
+  }
+  if (instrument_state_ != InstrumentState::Halted) {
+    return reject_lifecycle(OrderBookResult::InvalidStateTransition);
+  }
+  return execute_lifecycle(InstrumentState::Active,
+                           StatusEventKind::StateTransition,
+                           StatusReason::TradingResume, false, true);
+}
+
+LifecycleCommandResult MatchingEngine::process(
+    const CloseInstrument& command) noexcept {
+  if (!storage_.instrument_id().is_valid() ||
+      command.instrument_id != storage_.instrument_id()) {
+    return reject_lifecycle(OrderBookResult::InvalidInstrument);
+  }
+  if (instrument_state_ != InstrumentState::Active &&
+      instrument_state_ != InstrumentState::Halted) {
+    return reject_lifecycle(OrderBookResult::InvalidStateTransition);
+  }
+  return execute_lifecycle(InstrumentState::Closed, StatusEventKind::Reset,
+                           StatusReason::EndOfDay, true, false);
+}
+
+LifecycleCommandResult MatchingEngine::process(
+    const OpenInstrument& command) noexcept {
+  if (!storage_.instrument_id().is_valid() ||
+      command.instrument_id != storage_.instrument_id()) {
+    return reject_lifecycle(OrderBookResult::InvalidInstrument);
+  }
+  if (instrument_state_ != InstrumentState::Closed) {
+    return reject_lifecycle(OrderBookResult::InvalidStateTransition);
+  }
+  return execute_lifecycle(InstrumentState::Active,
+                           StatusEventKind::StateTransition,
+                           StatusReason::SessionOpen, false, true);
+}
+
 OrderBookResult MatchingEngine::validate_new_order(
     const NewOrder& order) const noexcept {
   if (!storage_.instrument_id().is_valid() ||
@@ -231,6 +296,13 @@ OrderBookResult MatchingEngine::validate_cancel_order(
   if (!storage_.instrument_id().is_valid() ||
       order.instrument_id != storage_.instrument_id()) {
     return OrderBookResult::InvalidInstrument;
+  }
+  if (instrument_state_ == InstrumentState::Closed) {
+    return OrderBookResult::InstrumentUnavailable;
+  }
+  if (instrument_state_ != InstrumentState::Active &&
+      instrument_state_ != InstrumentState::Halted) {
+    return OrderBookResult::InstrumentUnavailable;
   }
   if (!order.order_id.is_valid() || !storage_.find_order(order.order_id)) {
     return OrderBookResult::OrderNotFound;
@@ -484,9 +556,46 @@ void MatchingEngine::commit_reports(
   }
 }
 
-void MatchingEngine::fail_closed_outbox_full() noexcept {
-  if (instrument_state_ != InstrumentState::Active) {
-    fail_plan_execution();
+LifecycleCommandResult MatchingEngine::reject_lifecycle(
+    OrderBookResult result) const noexcept {
+  return {result, {}};
+}
+
+LifecycleCommandResult MatchingEngine::execute_lifecycle(
+    InstrumentState resulting_state, StatusEventKind event_kind,
+    StatusReason reason, bool reset_book,
+    bool preserve_safety_headroom) noexcept {
+  if (!command_sequence_available()) {
+    sequences_.reject_before_acceptance();
+    return reject_lifecycle(OrderBookResult::CapacityExhausted);
+  }
+
+  LifecycleCommandResult result;
+  result.command_sequence = accept_command();
+  result.result = commit_lifecycle_transition(
+      resulting_state, event_kind, reason, reset_book,
+      preserve_safety_headroom);
+
+#ifndef NDEBUG
+  assert(validate_invariants());
+#endif
+  return result;
+}
+
+OrderBookResult MatchingEngine::commit_lifecycle_transition(
+    InstrumentState resulting_state, StatusEventKind event_kind,
+    StatusReason reason, bool reset_book,
+    bool preserve_safety_headroom) noexcept {
+  const auto required_available = preserve_safety_headroom
+                                      ? std::size_t{2}
+                                      : std::size_t{1};
+  if (status_outbox_.available_capacity() < required_available) {
+    sequences_.abort_event_batch();
+    return OrderBookResult::StatusOutboxFull;
+  }
+  if (sequences_.last_engine().value() == EngineSequence::maximum_value) {
+    sequences_.abort_event_batch();
+    return OrderBookResult::CapacityExhausted;
   }
 
   auto reservation = status_outbox_.reserve(1);
@@ -498,19 +607,36 @@ void MatchingEngine::fail_closed_outbox_full() noexcept {
 
   const SystemStatus status{StatusScope::Instrument,
                             storage_.instrument_id(),
-                            InstrumentState::Active,
-                            InstrumentState::Halted,
-                            StatusEventKind::StateTransition,
-                            StatusReason::LosslessOutboxFull,
+                            instrument_state_,
+                            resulting_state,
+                            event_kind,
+                            reason,
                             engine_sequence.value};
   if (!reservation.write(status)) {
     fail_plan_execution();
   }
 
-  instrument_state_ = InstrumentState::Halted;
+  if (reset_book) {
+    storage_.clear();
+  }
+  instrument_state_ = resulting_state;
+
   const auto event_batch = sequences_.commit_event_batch(1);
   if (!event_batch.assigned() || event_batch.first != engine_sequence.value ||
       event_batch.last != engine_sequence.value || !reservation.commit()) {
+    fail_plan_execution();
+  }
+  return OrderBookResult::Accepted;
+}
+
+void MatchingEngine::fail_closed_outbox_full() noexcept {
+  if (instrument_state_ != InstrumentState::Active) {
+    fail_plan_execution();
+  }
+  if (commit_lifecycle_transition(InstrumentState::Halted,
+                                  StatusEventKind::StateTransition,
+                                  StatusReason::LosslessOutboxFull, false,
+                                  false) != OrderBookResult::Accepted) {
     fail_plan_execution();
   }
 }
@@ -519,7 +645,7 @@ bool MatchingEngine::command_sequence_available() const noexcept {
   return sequences_.last_command().value() < CommandSequence::maximum_value;
 }
 
-CommandSequence MatchingEngine::accept_command() {
+CommandSequence MatchingEngine::accept_command() noexcept {
   const auto assignment = sequences_.accept_command();
   if (!assignment.assigned()) {
     fail_plan_execution();
@@ -573,6 +699,10 @@ std::size_t MatchingEngine::status_outbox_capacity() const noexcept {
   return status_outbox_.capacity();
 }
 
+std::size_t MatchingEngine::available_status_outbox_capacity() const noexcept {
+  return status_outbox_.available_capacity();
+}
+
 bool MatchingEngine::try_consume_status(SystemStatus& status) noexcept {
   return status_outbox_.try_pop(status);
 }
@@ -617,7 +747,12 @@ bool MatchingEngine::validate_invariants() const noexcept {
       !execution_outbox_.validate_invariants() ||
       !status_outbox_.validate_invariants() ||
       (instrument_state_ != InstrumentState::Active &&
-       instrument_state_ != InstrumentState::Halted)) {
+       instrument_state_ != InstrumentState::Halted &&
+       instrument_state_ != InstrumentState::Closed) ||
+      (instrument_state_ == InstrumentState::Active &&
+       status_outbox_.available_capacity() == 0) ||
+      (instrument_state_ == InstrumentState::Closed &&
+       storage_.active_order_count() != 0)) {
     return false;
   }
   const auto bid = storage_.best_bid();
