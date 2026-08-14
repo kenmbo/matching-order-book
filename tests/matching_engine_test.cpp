@@ -1107,7 +1107,7 @@ void test_execution_outbox_ordering_and_capacity_reuse(Checks& checks) {
   const auto instrument = instrument_id(checks, 30);
   const auto level_price = price(checks, 100);
   const auto one = quantity(checks, 1);
-  MatchingEngine buy_engine(instrument, {}, LosslessOutboxLimits{4, 1});
+  MatchingEngine buy_engine(instrument, {}, LosslessOutboxLimits{4, 2});
   for (std::uint64_t value = 1; value <= 3; ++value) {
     checks.require(submit(checks, buy_engine, order_id(checks, value),
                           Side::Sell, level_price, one)
@@ -1136,7 +1136,7 @@ void test_execution_outbox_ordering_and_capacity_reuse(Checks& checks) {
   checks.require(reused_published[0].engine_sequence.value() == 4);
   checks.require(reused_published[0].match_id.value() == 4);
 
-  MatchingEngine sell_engine(instrument, {}, LosslessOutboxLimits{4, 1});
+  MatchingEngine sell_engine(instrument, {}, LosslessOutboxLimits{4, 2});
   for (std::uint64_t value = 1; value <= 3; ++value) {
     checks.require(submit(checks, sell_engine, order_id(checks, 100 + value),
                           Side::Buy, level_price, one)
@@ -1162,7 +1162,7 @@ void test_zero_output_commands_ignore_full_execution_outbox(Checks& checks) {
   const auto ask_price = price(checks, 100);
   const auto bid_price = price(checks, 90);
   const auto target = order_id(checks, 10);
-  MatchingEngine engine(instrument, {}, LosslessOutboxLimits{1, 1});
+  MatchingEngine engine(instrument, {}, LosslessOutboxLimits{1, 2});
 
   checks.require(submit(checks, engine, order_id(checks, 1), Side::Sell,
                         ask_price, quantity(checks, 1))
@@ -1203,7 +1203,7 @@ void test_new_order_outbox_failure_is_atomic_and_halts(Checks& checks) {
   const auto level_price = price(checks, 100);
   const auto one = quantity(checks, 1);
   const auto failed_order = order_id(checks, 20);
-  MatchingEngine engine(instrument, {}, LosslessOutboxLimits{2, 1});
+  MatchingEngine engine(instrument, {}, LosslessOutboxLimits{2, 2});
 
   for (std::uint64_t value = 1; value <= 3; ++value) {
     checks.require(submit(checks, engine, order_id(checks, value), Side::Sell,
@@ -1268,7 +1268,7 @@ void test_amend_outbox_failure_is_atomic_and_halts(Checks& checks) {
   const auto resting_ask = order_id(checks, 12);
   const auto old_price = price(checks, 90);
   const auto crossing_price = price(checks, 100);
-  MatchingEngine engine(instrument, {}, LosslessOutboxLimits{1, 1});
+  MatchingEngine engine(instrument, {}, LosslessOutboxLimits{1, 2});
 
   checks.require(submit(checks, engine, order_id(checks, 1), Side::Sell,
                         crossing_price, quantity(checks, 1))
@@ -1324,7 +1324,7 @@ void test_fill_capacity_boundary(Checks& checks) {
   const auto instrument = instrument_id(checks, 13);
   const auto ask_price = price(checks, 100);
   const auto one = quantity(checks, 1);
-  MatchingEngine permitted(instrument, {}, LosslessOutboxLimits{256, 1});
+  MatchingEngine permitted(instrument, {}, LosslessOutboxLimits{256, 2});
   for (std::uint64_t value = 1; value <= 256; ++value) {
     checks.require(submit(checks, permitted, order_id(checks, value),
                           Side::Sell, ask_price, one)
@@ -1376,7 +1376,7 @@ void test_amend_fill_capacity_boundary(Checks& checks) {
   const auto crossing_price = price(checks, 100);
   const auto one = quantity(checks, 1);
 
-  MatchingEngine permitted(instrument, {}, LosslessOutboxLimits{256, 1});
+  MatchingEngine permitted(instrument, {}, LosslessOutboxLimits{256, 2});
   const auto permitted_target = order_id(checks, 1);
   checks.require(submit(checks, permitted, permitted_target, Side::Buy,
                         old_price, quantity(checks, 256))
