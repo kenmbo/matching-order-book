@@ -499,6 +499,35 @@ void test_query_values_are_copies(Checks& checks) {
   require_invariants(checks, book);
 }
 
+void test_clear_releases_all_logical_state(Checks& checks) {
+  const auto instrument = instrument_id(checks, 15);
+  OrderBookStorage book(instrument);
+  checks.require(book.insert_resting(order_id(checks, 1), instrument,
+                                     Side::Buy, price(checks, 99),
+                                     quantity(checks, 3)) ==
+                 OrderBookResult::Accepted);
+  checks.require(book.insert_resting(order_id(checks, 2), instrument,
+                                     Side::Sell, price(checks, 101),
+                                     quantity(checks, 5)) ==
+                 OrderBookResult::Accepted);
+
+  book.clear();
+  checks.require(book.active_order_count() == 0);
+  checks.require(book.price_level_count(Side::Buy) == 0);
+  checks.require(book.price_level_count(Side::Sell) == 0);
+  checks.require(!book.best_bid() && !book.best_ask());
+  checks.require(book.depth(Side::Buy).empty());
+  checks.require(book.depth(Side::Sell).empty());
+  require_invariants(checks, book);
+
+  checks.require(book.insert_resting(order_id(checks, 1), instrument,
+                                     Side::Sell, price(checks, 102),
+                                     quantity(checks, 7)) ==
+                 OrderBookResult::Accepted);
+  checks.require(book.find_order(order_id(checks, 1)).has_value());
+  require_invariants(checks, book);
+}
+
 }  // namespace
 
 int main() {
@@ -516,5 +545,6 @@ int main() {
   test_aggregate_overflow(checks);
   test_invalid_and_unknown_inputs(checks);
   test_query_values_are_copies(checks);
+  test_clear_releases_all_logical_state(checks);
   return checks.passed() ? 0 : 1;
 }
