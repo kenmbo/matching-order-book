@@ -39,6 +39,11 @@ normative result in `docs/book-rules.md` has a distinct representation.
 public entry point can validate routing before looking up an order. These are
 fixed-size values and contain no storage handles or book references.
 
+`HaltInstrument`, `ResumeInstrument`, `CloseInstrument`, and `OpenInstrument`
+are the four normalized local lifecycle commands. Each contains only its
+`InstrumentId`. `CommandKind` assigns them the distinct values `Halt`,
+`Resume`, `Close`, and `Open` after the existing order-entry kinds.
+
 `ExecutionReport` contains the match and instrument IDs, aggressive and
 resting order IDs, match price and quantity, and its committed engine sequence.
 `SystemStatus` remains a separate event and contains scope, optional instrument
@@ -77,6 +82,25 @@ assigned only by committing a complete event batch:
 * a multi-event commit receives one contiguous inclusive sequence range;
 * an aborted transaction or failed reservation consumes no engine sequence;
 * a failed batch followed by a successful batch creates no sequence gap.
+
+If lossless execution-report reservation fails, those rules apply to the
+rejected order transaction. The separate fail-closed control transaction
+commits one `SystemStatus` and therefore consumes one engine sequence of its
+own.
+
+Lifecycle commands validate the instrument and transition table before the
+acceptance boundary. `InvalidInstrument` and `InvalidStateTransition` consume
+no sequence. A valid lifecycle command then consumes one `CommandSequence`
+before status-capacity and engine-sequence preflight. `StatusOutboxFull` or
+engine-sequence `CapacityExhausted` after that point retains the command
+sequence but consumes no engine sequence and publishes nothing. Every
+successful lifecycle control transaction consumes exactly one engine sequence
+and no match ID.
+
+`SystemStatus` uses `TradingHalt`, `TradingResume`, `EndOfDay`,
+`LosslessOutboxFull`, and `SessionOpen` to distinguish operator transitions,
+the automatic safety halt, destructive close, and new-session open. Halt,
+resume, automatic halt, and open use `StateTransition`; close uses `Reset`.
 
 `SequenceState::commit_event_batch` checks the entire range before advancing.
 `abort_event_batch` is explicit and does not alter engine sequence state. There
