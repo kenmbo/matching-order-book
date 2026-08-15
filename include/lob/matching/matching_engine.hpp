@@ -13,6 +13,8 @@
 
 namespace lob {
 
+struct MatchingEngineTestAccess;
+
 inline constexpr std::size_t kMaximumFillsPerCommand = std::size_t{1} << 8;
 inline constexpr std::size_t kDefaultExecutionOutboxCapacity =
     std::size_t{1} << 10;
@@ -97,6 +99,10 @@ class MatchingEngine final {
   [[nodiscard]] bool validate_invariants() const noexcept;
 
  private:
+  // Milestone 7 uses one narrow test fixture to construct near-exhausted
+  // counters without adding public sequence mutation to the engine contract.
+  friend struct MatchingEngineTestAccess;
+
   struct LogicalOrder final {
     OrderId order_id{};
     InstrumentId instrument_id{};
