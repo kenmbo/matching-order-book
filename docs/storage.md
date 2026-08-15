@@ -17,6 +17,14 @@ An execution-outbox failure therefore occurs before any storage mutation; the
 separate automatic halt changes engine-owned instrument state while preserving
 all storage contents and FIFO priority.
 
+Milestone 6 adds one narrow `clear()` operation for the local end-of-day
+transition. The matching engine preflights and reserves the required status
+record before invoking it. `clear()` removes all active-index entries, bid and
+ask levels, FIFO records, and aggregates without deciding lifecycle policy or
+publishing output. It retains container capacity where the standard baseline
+representation permits, and a subsequent session may reuse previously active
+order IDs.
+
 The baseline is correctness-first. It uses standard-library containers:
 
 * an `std::unordered_map` indexes currently active orders by `OrderId`;
@@ -44,7 +52,7 @@ capacity is full, provided active-order and aggregate capacity remain.
 Ordinary rejection returns an explicit `OrderBookResult` and leaves logical
 state unchanged.
 
-Order-ID uniqueness is active-only under `docs/book-rules.md` v0.4. Removing an
+Order-ID uniqueness is active-only under `docs/book-rules.md` v0.5. Removing an
 order erases it from the active index, so the same ID can be used by a later
 resting-order insertion. No historical-ID collection is retained.
 
