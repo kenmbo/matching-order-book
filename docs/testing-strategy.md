@@ -17,6 +17,78 @@ milestone.
 Milestone 0 validates only the build and test harness. The smoke test contains
 no order-book behavior and is not evidence for later behavioral milestones.
 
+## Phase 1 hardening and reference boundary
+
+Milestone 7 adds a deliberately simple reference book under `tests/`. It uses
+ordered maps of price levels and vectors for FIFO membership, scans for active
+IDs, and applies commands by copying logical model state before a transaction.
+It does not call `MatchingEngine`, `OrderBookStorage`, the production match
+planner, or production mutation helpers to calculate an expected result. It
+reuses only fixed-width domain contracts, public result/event types, and the
+documented capacity constants.
+
+The differential runner drains both outboxes after every ordinary command and
+compares the returned result, accepted command sequence, synchronous reports,
+lifecycle state, all sequence and match counters, active counts, level counts,
+BBO, full depth, aggregates, active-order fields, per-level FIFO ordering, and
+the exact committed execution and status batches. Separate property checks
+verify aggressive and resting quantity conservation, resting-price execution,
+and price-time report order. Both the model and the engine invariant hooks run
+after every generated command.
+
+The text trace format is one normalized command per line:
+
+```text
+N <order> <instrument> <B|S|I> <price> <quantity>
+C <order> <instrument>
+A <order> <instrument> <new-price> <new-leaves>
+H|R|X|O <instrument>
+```
+
+`H`, `R`, `X`, and `O` mean halt, resume, close, and open. Zero represents a
+reserved invalid domain sentinel in adversarial traces. Comment lines begin
+with `#`. The permanent `tests/fixtures/phase1_replay.trace` fixture covers
+matching, amendments, active-ID reuse, invalid inputs, halted cancellation,
+close/open reset, and lifecycle rejection.
+
+The default CTest case runs 2,500 commands for each fixed seed `0x5eed`,
+`0xc0ffee`, `0x12345678`, and `0xd1ff3e`, then serializes, parses, and replays
+each generated trace. The deterministic extended soak runs 25,000 commands per
+seed (100,000 total):
+
+```bash
+./build/debug/tests/lob_phase1_reference_model_test --soak
+```
+
+One counterexample can be reproduced with explicit decimal seed and count, or
+a saved trace can be replayed directly:
+
+```bash
+./build/debug/tests/lob_phase1_reference_model_test --seed 12648430 --commands 25000
+./build/debug/tests/lob_phase1_reference_model_test --replay tests/fixtures/phase1_replay.trace
+```
+
+On a mismatch the runner prints the seed, command index, command, expected and
+actual state, and the complete replayable prefix. A discovered counterexample
+must be minimized and committed under `tests/fixtures/` before its production
+fix is applied.
+
+Focused hardening tests construct near-maximum counters through a private
+friend fixture; no public sequence mutation API exists. They cover the last
+assignable command, engine sequence, and match ID, contiguous-range shortage,
+maximum price and quantity, aggregate overflow, exact 256-report fit, 255-slot
+shortage, fail-closed publication, and lifecycle engine-sequence preflight.
+The existing focused suites retain active-order/level/status capacity,
+wraparound, abort/reuse, validation precedence, and reset coverage.
+
+In Debug, the storage scan validates index/FIFO bijection, membership,
+aggregates, non-empty ordered levels, counts, capacities, and BBO. The engine
+adds uncrossed-active, closed-empty, status-headroom, lifecycle-state, and
+execution/status outbox occupancy/reservation checks. Tests call the hook on
+successes, rejections, and aborted operations. The expensive storage scan is
+compiled to constant-time success under `NDEBUG`; Release retains only the
+constant-time engine/outbox checks.
+
 ## Test layers
 
 Tests are organized by the narrowest useful scope:
