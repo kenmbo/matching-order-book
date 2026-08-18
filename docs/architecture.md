@@ -157,6 +157,14 @@ uses an order-ID lookup, price-level indexes, and FIFO queues; Phase 2 may
 replace per-order allocation with a fixed-size object pool without changing
 the public behavior or component boundary.
 
+The Phase 1 storage representation is intentionally allocating. Its bounded
+logical capacities do not imply that standard-container nodes were
+preallocated. Milestone 8 measures and discloses those timed allocations as a
+diagnostic while requiring the benchmark harness itself to remain
+allocation-free inside the timed loop. Milestone 10 replaces this exception
+with strict zero allocation and deallocation for the complete timed
+command-processing path and records a separate before/after baseline.
+
 Milestone 3 implements the `Plan` and `Execute` sides of this lifecycle for
 `NewOrder`.  Its internal fixed-size plan records at most 256 resting order
 IDs, resting prices, and fill quantities, plus the aggressive remainder.  The
