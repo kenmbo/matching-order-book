@@ -11,6 +11,9 @@ The measured boundaries are:
 
 * **Matching-core latency:** normalized command entry into `process()` through
   completed book mutation and preparation of every output slot.
+* **Local process-completion latency:** normalized command entry into the
+  public `MatchingEngine::process()` overload through its return. This is the
+  canonical Milestone 8 local boundary.
 * **Local command-to-outbox latency:** normalized local command entry through
   publication of the outbox producer cursor.
 * **External per-message latency:** decoder start for a packet already in
@@ -28,6 +31,15 @@ trace construction are excluded from userspace processing measurements.
 Kernel-inclusive measurement, if later added, is named
 `socket ingress -> publish` and reported separately.
 
+For a command that emits execution reports, public `process()` returns only
+after the complete reserved batch and producer cursor are committed, so local
+process-completion also observes command-to-outbox publication. Zero-event
+commands do not advance an execution-outbox cursor and are reported only as
+process-completion latency. Milestone 8 does not add a private matching-core
+seam: `matching_core_measured` is false. A full public-path pass against the
+tighter matching-core band is conservative upper-bound evidence only; a miss
+is inconclusive about the unobserved internal boundary.
+
 ## Build and environment controls
 
 Use the `release` preset and compile the benchmark target with
@@ -40,6 +52,20 @@ Pin the benchmark thread to one physical core and keep its SMT sibling idle
 when possible. Warm code, book state, pools, and benchmark data before
 measurement. Pre-generate commands, packets, distributions, and expected
 branch paths. Result collection is bounded and preallocated.
+
+Milestone 8 uses a separate allocation-audit execution of each deterministic
+trace so allocator interposition cannot distort the canonical latency run.
+Bounded non-allocating counters distinguish engine/outbox and benchmark-buffer
+construction, initial book population, trace generation, warm-up, timed public
+`process()` calls, timed-loop sample/checksum collection, and post-run
+statistics/serialization. Sorting and serialization occur after measurement.
+The audit reports total timed `process()` activity rather than claiming dynamic
+attribution that would change code generation. A source audit identifies the
+possible Phase 1 production sites as `std::map::try_emplace` price-level nodes,
+`std::list::push_back` FIFO nodes, and `std::unordered_map::emplace` active-ID
+nodes, plus their corresponding erasure deallocations. Trace, sample,
+collection, checksum, metric, and output code owns no allocation in the timed
+loop.
 
 The Release benchmark target is built with:
 
@@ -92,7 +118,10 @@ and a fresh acceptance run.
 The local matching-core initial band is p50 <= 500 ns, p99 <= 2 us,
 p99.9 <= 6 us, and throughput >= 1 million commands/s. The later goal is
 p50 <= 250 ns, p99 <= 1 us, p99.9 <= 3 us, and throughput >= 2 million
-commands/s.
+commands/s. During Milestone 8 this band is informational because its exact
+endpoint is not independently observable. A public process-completion pass may
+be recorded as conservative evidence but is not an independently measured
+matching-core baseline.
 
 Multi-fill matching uses this p99 ceiling:
 
@@ -103,11 +132,16 @@ Multi-fill matching uses this p99 ceiling:
 For one emitted event per fill, the ceilings for 1, 4, 16, 64, and 256 fills
 are 1.3 us, 2.2 us, 5.8 us, 20.2 us, and 77.8 us respectively. Use the actual
 event count when a fill emits more than one event.
+During Milestone 8 these matching-core ceilings are informational. A public
+process-completion pass is conservative evidence; a public-path miss is
+inconclusive about the unobserved internal boundary and is not a Milestone 8
+failure.
 
-The local command-to-outbox initial band is p50 <= 1.5 us, p99 <= 5 us,
-p99.9 <= 15 us, and throughput >= 500,000 commands/s. Its later goal is
+The Milestone 8 local process-completion initial band is p50 <= 1.5 us, p99 <=
+5 us, p99.9 <= 15 us, and throughput >= 500,000 commands/s. Its later goal is
 p50 <= 750 ns, p99 <= 3 us, p99.9 <= 8 us, and throughput >= 1 million
-commands/s.
+commands/s. For report-producing commands this is also the observable local
+command-to-outbox band.
 
 The contiguous external normal-path initial band is amortized p50 <= 1.5 us,
 p99 <= 5 us, p99.9 <= 15 us, and throughput >= 500,000 messages/s. Its later
@@ -132,8 +166,18 @@ Before accepting a run:
 * report fill-count and emitted-event-count distributions;
 * report packet sizes and messages per packet;
 * confirm output publication is included and downstream consumption excluded;
-* confirm zero heap allocations in the timed steady-state path.
+* confirm zero benchmark-owned heap allocations in the timed loop;
+* for the Milestone 8 `phase1_allocating_storage` profile, measure and disclose
+  total allocations, allocated bytes, and deallocations inside public
+  `process()` calls;
+* beginning with Milestone 10, confirm zero allocation and deallocation
+  anywhere in the timed command-processing path.
 
-Reject any run with missing metadata, incorrect workload composition, hot RNG,
-heap allocation, or unplanned consumer work in the timed region. Store raw
-results with a human-readable baseline report.
+Run validity, allocation-policy compliance, and performance-gate compliance
+are separate outcomes. Reject any run with missing metadata, incorrect
+workload composition, hot RNG, benchmark-owned timed allocation, or unplanned
+consumer work. Phase 1 storage allocation is diagnostic and does not invalidate
+Milestone 8. Starting with Milestone 10, any timed allocation or deallocation
+invalidates the run. Store machine-readable results with a human-readable
+baseline report, and never overwrite the Phase 1 allocating baseline with the
+strict-zero Milestone 10 baseline.
