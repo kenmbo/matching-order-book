@@ -39,6 +39,15 @@ This representation may allocate through standard containers. It is not the
 fixed-size object pool assigned to Milestones 9 and 10, and no performance
 claim is made for it.
 
+For Milestone 8, allocations and deallocations originating from these
+containers during public `MatchingEngine::process()` calls are permitted only
+as a measured Phase 1 diagnostic. They must be counted and disclosed, and the
+result must be labeled `phase1_allocating_storage`. Benchmark-owned trace,
+sample, checksum, statistics, and serialization storage must still be prepared
+outside the timed loop. Milestone 10 ends this exception: any allocation or
+deallocation anywhere in the timed command-processing path then invalidates
+the run.
+
 ## Capacity and failure behavior
 
 Production limits are 131,072 active orders per book and 4,096 active price
