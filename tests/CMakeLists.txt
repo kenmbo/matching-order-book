@@ -33,6 +33,16 @@ target_compile_definitions(
 add_executable(lob_phase1_hardening_test phase1_hardening_test.cpp)
 target_link_libraries(lob_phase1_hardening_test PRIVATE lob::engine)
 
+add_executable(
+  lob_benchmark_support_test
+  benchmark_support_test.cpp
+  ../benchmarks/benchmark_support.cpp
+)
+target_include_directories(
+  lob_benchmark_support_test PRIVATE ${CMAKE_SOURCE_DIR}/benchmarks
+)
+target_link_libraries(lob_benchmark_support_test PRIVATE lob_build_options)
+
 add_test(NAME lob.smoke COMMAND lob_smoke_test)
 add_test(NAME lob.domain_contracts COMMAND lob_domain_contracts_test)
 add_test(NAME lob.order_book_storage COMMAND lob_order_book_storage_test)
@@ -41,3 +51,23 @@ add_test(NAME lob.matching_engine COMMAND lob_matching_engine_test)
 add_test(NAME lob.instrument_lifecycle COMMAND lob_instrument_lifecycle_test)
 add_test(NAME lob.phase1_reference_model COMMAND lob_phase1_reference_model_test)
 add_test(NAME lob.phase1_hardening COMMAND lob_phase1_hardening_test)
+add_test(NAME lob.benchmark_support COMMAND lob_benchmark_support_test)
+add_test(
+  NAME lob.benchmark_smoke
+  COMMAND lob_phase1_benchmark
+    --mode smoke
+    --workload mixed
+    --seeds 24301
+    --samples 1000
+    --warmup 100
+    --repetitions 1
+)
+set_tests_properties(
+  lob.benchmark_smoke
+  PROPERTIES PASS_REGULAR_EXPRESSION "\"schema\": \"lob.phase1.performance.v1\""
+)
+add_test(
+  NAME lob.benchmark_invalid_config
+  COMMAND lob_phase1_benchmark --mode acceptance --workload mixed
+)
+set_tests_properties(lob.benchmark_invalid_config PROPERTIES WILL_FAIL TRUE)
