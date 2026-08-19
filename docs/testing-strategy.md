@@ -89,6 +89,27 @@ successes, rejections, and aborted operations. The expensive storage scan is
 compiled to constant-time success under `NDEBUG`; Release retains only the
 constant-time engine/outbox checks.
 
+## Standalone pool validation
+
+Milestone 9 tests the fixed-object pool independently of book storage and
+matching. Focused cases cover configured and production capacity, ascending
+initial allocation, circular free-FIFO wrap, release-order reuse, repeated
+full cycles, counter/high-water identities, invalid/foreign/duplicate/stale
+handles, reset epochs, fail-closed generation and epoch exhaustion,
+over-alignment, and non-trivial object lifetimes. Debug invariant scans verify
+the occupancy/free-index bijection at empty, partial, wrapped, and full states.
+
+A dedicated allocation-audit executable permits the pool's two construction
+allocations, takes a counter snapshot after construction and benchmark-buffer
+setup, and requires exactly zero allocations, allocated bytes, and
+deallocations across acquire/release/reuse/reset cycles. Lifecycle counters
+separately prove that reset and destruction reclaim every live object exactly
+once, including when LeakSanitizer cannot run in a restricted environment.
+
+The full-capacity and repeated-reuse cases run in Debug, ASan, and UBSan. The
+Release benchmark smoke is deterministic and separate from sanitizer timing;
+the canonical component measurement uses the Release preset only.
+
 ## Test layers
 
 Tests are organized by the narrowest useful scope:
