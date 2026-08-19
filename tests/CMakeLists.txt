@@ -33,6 +33,17 @@ target_compile_definitions(
 add_executable(lob_phase1_hardening_test phase1_hardening_test.cpp)
 target_link_libraries(lob_phase1_hardening_test PRIVATE lob::engine)
 
+add_executable(lob_fixed_object_pool_test fixed_object_pool_test.cpp)
+target_link_libraries(lob_fixed_object_pool_test PRIVATE lob::engine)
+
+add_executable(
+  lob_fixed_object_pool_allocation_test
+  fixed_object_pool_allocation_test.cpp
+)
+target_link_libraries(
+  lob_fixed_object_pool_allocation_test PRIVATE lob::engine
+)
+
 add_executable(
   lob_benchmark_support_test
   benchmark_support_test.cpp
@@ -51,6 +62,11 @@ add_test(NAME lob.matching_engine COMMAND lob_matching_engine_test)
 add_test(NAME lob.instrument_lifecycle COMMAND lob_instrument_lifecycle_test)
 add_test(NAME lob.phase1_reference_model COMMAND lob_phase1_reference_model_test)
 add_test(NAME lob.phase1_hardening COMMAND lob_phase1_hardening_test)
+add_test(NAME lob.fixed_object_pool COMMAND lob_fixed_object_pool_test)
+add_test(
+  NAME lob.fixed_object_pool_allocation
+  COMMAND lob_fixed_object_pool_allocation_test
+)
 add_test(NAME lob.benchmark_support COMMAND lob_benchmark_support_test)
 add_test(
   NAME lob.benchmark_smoke
@@ -65,6 +81,40 @@ add_test(
 set_tests_properties(
   lob.benchmark_smoke
   PROPERTIES PASS_REGULAR_EXPRESSION "\"schema\": \"lob.phase1.performance.v1\""
+)
+add_test(
+  NAME lob.fixed_object_pool_benchmark_smoke
+  COMMAND lob_fixed_object_pool_benchmark
+    --mode smoke
+    --capacity 256
+    --repetitions 1
+    --full-cycles 2
+    --churn-operations 1000
+    --warmup-cycles 1
+)
+set_tests_properties(
+  lob.fixed_object_pool_benchmark_smoke
+  PROPERTIES
+    PASS_REGULAR_EXPRESSION
+      "\"schema\": \"lob.fixed_object_pool.performance.v1\""
+)
+add_test(
+  NAME lob.fixed_object_pool_benchmark_allocation_smoke
+  COMMAND lob_fixed_object_pool_allocation_audit
+    --mode smoke
+    --capacity 256
+    --repetitions 1
+    --full-cycles 2
+    --churn-operations 1000
+    --warmup-cycles 1
+    --allocation-output
+      ${CMAKE_CURRENT_BINARY_DIR}/fixed_object_pool_smoke.alloc
+)
+set_tests_properties(
+  lob.fixed_object_pool_benchmark_allocation_smoke
+  PROPERTIES
+    PASS_REGULAR_EXPRESSION
+      "\"accepted\":true,\"timed_pool_allocations\":0"
 )
 add_test(
   NAME lob.benchmark_invalid_config
