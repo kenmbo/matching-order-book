@@ -1,0 +1,13 @@
+LOB_POOL_ALLOCATION_V1
+capacity 131072
+repetitions 5
+full_cycles 8
+churn_operations 1000000
+warmup_cycles 2
+construction 15 34079080 0
+preparation 45 275343680 0
+warmup 0 0 0
+timed_pool 0 0 0
+timed_collection 0 0 0
+post_statistics 0 0 0
+destruction 0 0 15
