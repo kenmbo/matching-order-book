@@ -157,6 +157,14 @@ uses an order-ID lookup, price-level indexes, and FIFO queues; Phase 2 may
 replace per-order allocation with a fixed-size object pool without changing
 the public behavior or component boundary.
 
+Milestone 9 provides that fixed-object pool only as a standalone component.
+It owns one aligned slot array and one free-index array allocated completely at
+startup, uses owner/index/generation/epoch handles, and remains absent from
+both `OrderBookStorage` and `MatchingEngine`. Milestone 10 is the first
+milestone permitted to make storage own the pool or include node reservation
+in matching transaction preflight. The standalone contract is recorded in
+`docs/fixed-object-pool.md`.
+
 The Phase 1 storage representation is intentionally allocating. Its bounded
 logical capacities do not imply that standard-container nodes were
 preallocated. Milestone 8 measures and discloses those timed allocations as a

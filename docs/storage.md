@@ -39,6 +39,12 @@ This representation may allocate through standard containers. It is not the
 fixed-size object pool assigned to Milestones 9 and 10, and no performance
 claim is made for it.
 
+Milestone 9 adds the standalone pool described by
+`docs/fixed-object-pool.md`, but deliberately does not change this
+representation. `OrderBookStorage` continues to own its existing `std::list`
+nodes and indexes until Milestone 10. No Phase 1 storage result, mutation,
+capacity preflight, or observable behavior changes in Milestone 9.
+
 For Milestone 8, allocations and deallocations originating from these
 containers during public `MatchingEngine::process()` calls are permitted only
 as a measured Phase 1 diagnostic. They must be counted and disclosed, and the
