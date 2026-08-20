@@ -9,6 +9,10 @@ benchmark target; performance measurement starts in its scheduled milestone.
 
 The measured boundaries are:
 
+* **Standalone fixed-object-pool latency:** one pool `acquire` or `release`, a
+  complete acquire/drain cycle, or one paired release/acquire churn operation.
+  This Milestone 9 component boundary excludes book storage and matching and
+  is not compared directly with public `MatchingEngine::process()` latency.
 * **Matching-core latency:** normalized command entry into `process()` through
   completed book mutation and preparation of every output slot.
 * **Local process-completion latency:** normalized command entry into the
@@ -73,6 +77,16 @@ The Release benchmark target is built with:
 cmake --preset release
 cmake --build --preset release --target benchmarks
 ```
+
+For the Milestone 9 pool baseline, the pool is constructed and warmed before
+measurement. Full-capacity cycles and a deterministic half-full churn trace
+use preallocated handle, operation, and sample arrays. A separate allocation
+audit repeats the operation sequence without latency collection and requires
+zero allocations, bytes, and deallocations in both timed pool operations and
+timed sample/checksum collection. Startup backing allocation is reported
+separately. The pool baseline records latency and throughput without a
+speculative threshold and does not replace the Milestone 8 allocating-storage
+artifacts.
 
 ## Workloads
 
