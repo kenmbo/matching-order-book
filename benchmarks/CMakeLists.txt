@@ -45,6 +45,46 @@ target_compile_definitions(
     LOB_BENCHMARK_GIT_DIRTY=${LOB_BENCHMARK_GIT_DIRTY}
 )
 
+add_executable(lob_fixed_object_pool_benchmark fixed_object_pool_benchmark.cpp)
+target_include_directories(
+  lob_fixed_object_pool_benchmark PRIVATE ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(
+  lob_fixed_object_pool_benchmark PRIVATE lob_benchmark_support lob_build_options
+)
+target_compile_definitions(
+  lob_fixed_object_pool_benchmark
+  PRIVATE
+    LOB_BENCHMARK_GIT_COMMIT="${LOB_BENCHMARK_GIT_COMMIT}"
+    LOB_BENCHMARK_GIT_DIRTY=${LOB_BENCHMARK_GIT_DIRTY}
+    LOB_BENCHMARK_BUILD_TYPE="$<CONFIG>"
+)
+
+add_executable(
+  lob_fixed_object_pool_allocation_audit
+  fixed_object_pool_benchmark.cpp
+)
+target_include_directories(
+  lob_fixed_object_pool_allocation_audit PRIVATE ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(
+  lob_fixed_object_pool_allocation_audit
+  PRIVATE lob_benchmark_support lob_build_options
+)
+target_compile_definitions(
+  lob_fixed_object_pool_allocation_audit
+  PRIVATE
+    LOB_ENABLE_POOL_ALLOCATION_AUDIT=1
+    LOB_BENCHMARK_GIT_COMMIT="${LOB_BENCHMARK_GIT_COMMIT}"
+    LOB_BENCHMARK_GIT_DIRTY=${LOB_BENCHMARK_GIT_DIRTY}
+    LOB_BENCHMARK_BUILD_TYPE="$<CONFIG>"
+)
+
 add_custom_target(
-  benchmarks DEPENDS lob_phase1_benchmark lob_phase1_allocation_audit
+  benchmarks
+  DEPENDS
+    lob_phase1_benchmark
+    lob_phase1_allocation_audit
+    lob_fixed_object_pool_benchmark
+    lob_fixed_object_pool_allocation_audit
 )
