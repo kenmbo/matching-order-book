@@ -58,9 +58,9 @@ class MatchingEngine final {
   MatchingEngine& operator=(MatchingEngine&&) = delete;
   ~MatchingEngine() = default;
 
-  [[nodiscard]] NewOrderResult process(const NewOrder& order);
-  [[nodiscard]] CancelOrderResult process(const CancelOrder& order);
-  [[nodiscard]] AmendOrderResult process(const AmendOrder& order);
+  [[nodiscard]] NewOrderResult process(const NewOrder& order) noexcept;
+  [[nodiscard]] CancelOrderResult process(const CancelOrder& order) noexcept;
+  [[nodiscard]] AmendOrderResult process(const AmendOrder& order) noexcept;
   [[nodiscard]] LifecycleCommandResult process(
       const HaltInstrument& command) noexcept;
   [[nodiscard]] LifecycleCommandResult process(
@@ -87,6 +87,7 @@ class MatchingEngine final {
   [[nodiscard]] bool try_consume_status(SystemStatus& status) noexcept;
   [[nodiscard]] std::size_t active_order_count() const noexcept;
   [[nodiscard]] std::size_t price_level_count(Side side) const noexcept;
+  [[nodiscard]] StorageDiagnostics storage_diagnostics() const noexcept;
   [[nodiscard]] std::optional<RestingOrderView> find_order(
       OrderId order_id) const noexcept;
   [[nodiscard]] std::optional<PriceTicks> best_bid() const noexcept;
