@@ -107,16 +107,13 @@ class FixedObjectPool final {
   template <typename... Args>
     requires std::is_nothrow_constructible_v<T, Args...>
   [[nodiscard]] AcquireResult acquire(Args&&... args) noexcept {
-    if (free_count_ == 0) {
-      return {PoolAcquireStatus::Exhausted, {}};
+    const auto status = next_acquire_status();
+    if (status != PoolAcquireStatus::Acquired) {
+      return {status, {}};
     }
 
     const auto index = free_indices_[free_head_];
     Slot& slot = slots_[index];
-    if (slot.generation == std::numeric_limits<generation_type>::max()) {
-      return {PoolAcquireStatus::GenerationExhausted, {}};
-    }
-
     const auto next_generation =
         static_cast<generation_type>(slot.generation + generation_type{1});
     std::construct_at(slot.raw_object_pointer(), std::forward<Args>(args)...);
@@ -164,7 +161,7 @@ class FixedObjectPool final {
   }
 
   [[nodiscard]] PoolResetStatus reset() noexcept {
-    if (epoch_ == std::numeric_limits<epoch_type>::max()) {
+    if (!can_reset()) {
       return PoolResetStatus::GenerationExhausted;
     }
 
@@ -180,8 +177,40 @@ class FixedObjectPool final {
   [[nodiscard]] std::size_t high_water_count() const noexcept {
     return high_water_count_;
   }
+  [[nodiscard]] PoolAcquireStatus next_acquire_status() const noexcept {
+    if (free_count_ == 0) {
+      return PoolAcquireStatus::Exhausted;
+    }
+    const auto index = free_indices_[free_head_];
+    return slots_[index].generation ==
+                   std::numeric_limits<generation_type>::max()
+               ? PoolAcquireStatus::GenerationExhausted
+               : PoolAcquireStatus::Acquired;
+  }
+  [[nodiscard]] PoolAcquireStatus acquire_status_after_release(
+      Handle first_release) const noexcept {
+    if (free_count_ != 0) {
+      return next_acquire_status();
+    }
+    if (!valid_handle(first_release)) {
+      return PoolAcquireStatus::Exhausted;
+    }
+    return slots_[first_release.index_].generation ==
+                   std::numeric_limits<generation_type>::max()
+               ? PoolAcquireStatus::GenerationExhausted
+               : PoolAcquireStatus::Acquired;
+  }
+  [[nodiscard]] bool can_reset() const noexcept {
+    return epoch_ != std::numeric_limits<epoch_type>::max();
+  }
   [[nodiscard]] std::size_t backing_memory_bytes() const noexcept {
     return capacity_ * (sizeof(Slot) + sizeof(index_type));
+  }
+  [[nodiscard]] std::size_t slot_backing_memory_bytes() const noexcept {
+    return capacity_ * sizeof(Slot);
+  }
+  [[nodiscard]] std::size_t free_index_backing_memory_bytes() const noexcept {
+    return capacity_ * sizeof(index_type);
   }
   [[nodiscard]] static constexpr std::size_t slot_size_bytes() noexcept {
     return sizeof(Slot);
