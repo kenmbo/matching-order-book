@@ -1,12 +1,15 @@
 #include "lob/storage/order_book_storage.hpp"
 
 #include <algorithm>
-#include <memory>
-#include <utility>
+#include <cassert>
+#include <cstdlib>
+#include <limits>
 
 namespace lob {
 
 namespace {
+
+[[noreturn]] void fail_storage_invariant() noexcept { std::abort(); }
 
 [[nodiscard]] RestingOrderView make_view(
     OrderId order_id, InstrumentId instrument_id, Side side, PriceTicks price,
@@ -14,7 +17,145 @@ namespace {
   return {order_id, instrument_id, side, price, leaves_quantity};
 }
 
+[[nodiscard]] std::size_t physical_capacity(std::size_t logical) noexcept {
+  return std::max(logical, std::size_t{1});
+}
+
 }  // namespace
+
+OrderBookStorage::ActiveOrderIndex::ActiveOrderIndex(
+    std::size_t maximum_entries) {
+  const auto target = std::max(std::size_t{2}, maximum_entries * 2);
+  capacity_ = 2;
+  while (capacity_ < target) {
+    capacity_ *= 2;
+  }
+  mask_ = capacity_ - 1;
+  entries_ = std::make_unique<Entry[]>(capacity_);
+}
+
+std::size_t OrderBookStorage::ActiveOrderIndex::bucket(
+    OrderId order_id) const noexcept {
+  std::uint64_t value = order_id.value();
+  value ^= value >> 33;
+  value *= UINT64_C(0xff51afd7ed558ccd);
+  value ^= value >> 33;
+  value *= UINT64_C(0xc4ceb9fe1a85ec53);
+  value ^= value >> 33;
+  return static_cast<std::size_t>(value) & mask_;
+}
+
+std::size_t OrderBookStorage::ActiveOrderIndex::find_position(
+    OrderId order_id) const noexcept {
+  auto position = bucket(order_id);
+  for (std::size_t probe = 0; probe < capacity_; ++probe) {
+    const Entry& entry = entries_[position];
+    if (!entry.occupied) {
+      return capacity_;
+    }
+    if (entry.order_id == order_id) {
+      return position;
+    }
+    position = (position + 1) & mask_;
+  }
+  return capacity_;
+}
+
+const OrderBookStorage::NodeLink*
+OrderBookStorage::ActiveOrderIndex::find(OrderId order_id) const noexcept {
+  const auto position = find_position(order_id);
+  return position == capacity_ ? nullptr : &entries_[position].link;
+}
+
+OrderBookStorage::NodeLink* OrderBookStorage::ActiveOrderIndex::find(
+    OrderId order_id) noexcept {
+  const auto position = find_position(order_id);
+  return position == capacity_ ? nullptr : &entries_[position].link;
+}
+
+bool OrderBookStorage::ActiveOrderIndex::insert(OrderId order_id,
+                                                NodeLink link) noexcept {
+  if (!order_id.is_valid() || link.is_invalid() || size_ * 2 >= capacity_) {
+    return false;
+  }
+  auto position = bucket(order_id);
+  for (std::size_t probe = 0; probe < capacity_; ++probe) {
+    Entry& entry = entries_[position];
+    if (!entry.occupied) {
+      entry = {order_id, link, true};
+      ++size_;
+      return true;
+    }
+    if (entry.order_id == order_id) {
+      return false;
+    }
+    position = (position + 1) & mask_;
+  }
+  return false;
+}
+
+bool OrderBookStorage::ActiveOrderIndex::erase(OrderId order_id) noexcept {
+  auto position = find_position(order_id);
+  if (position == capacity_) {
+    return false;
+  }
+
+  entries_[position] = {};
+  --size_;
+  position = (position + 1) & mask_;
+  while (entries_[position].occupied) {
+    const Entry displaced = entries_[position];
+    entries_[position] = {};
+    --size_;
+    if (!insert(displaced.order_id, displaced.link)) {
+      fail_storage_invariant();
+    }
+    position = (position + 1) & mask_;
+  }
+  return true;
+}
+
+void OrderBookStorage::ActiveOrderIndex::clear() noexcept {
+  for (std::size_t index = 0; index < capacity_; ++index) {
+    entries_[index] = {};
+  }
+  size_ = 0;
+}
+
+std::size_t OrderBookStorage::ActiveOrderIndex::size() const noexcept {
+  return size_;
+}
+
+std::size_t OrderBookStorage::ActiveOrderIndex::capacity() const noexcept {
+  return capacity_;
+}
+
+std::size_t OrderBookStorage::ActiveOrderIndex::backing_memory_bytes()
+    const noexcept {
+  return capacity_ * sizeof(Entry);
+}
+
+#ifndef NDEBUG
+bool OrderBookStorage::ActiveOrderIndex::validate_invariants() const noexcept {
+  if (capacity_ < 2 || (capacity_ & (capacity_ - 1)) != 0 ||
+      mask_ != capacity_ - 1 || size_ * 2 > capacity_) {
+    return false;
+  }
+  std::size_t occupied = 0;
+  for (std::size_t index = 0; index < capacity_; ++index) {
+    const Entry& entry = entries_[index];
+    if (!entry.occupied) {
+      continue;
+    }
+    if (!entry.order_id.is_valid() || entry.link.is_invalid() ||
+        find_position(entry.order_id) != index) {
+      return false;
+    }
+    ++occupied;
+  }
+  return occupied == size_;
+}
+#endif
 
 OrderBookStorage::OrderBookStorage(InstrumentId instrument_id,
                                    StorageLimits limits)
@@ -22,17 +163,168 @@ OrderBookStorage::OrderBookStorage(InstrumentId instrument_id,
       active_order_capacity_(
           std::min(limits.active_orders, kMaximumActiveOrders)),
       price_level_capacity_per_side_(std::min(
-          limits.price_levels_per_side, kMaximumPriceLevelsPerSide)) {
-  orders_.reserve(active_order_capacity_);
+          limits.price_levels_per_side, kMaximumPriceLevelsPerSide)),
+      order_pool_(physical_capacity(active_order_capacity_)),
+      orders_(active_order_capacity_),
+      bids_(std::make_unique<PriceLevel[]>(
+          physical_capacity(price_level_capacity_per_side_))),
+      asks_(std::make_unique<PriceLevel[]>(
+          physical_capacity(price_level_capacity_per_side_))) {}
+
+OrderBookStorage::NodeLink OrderBookStorage::to_link(
+    OrderHandle handle) noexcept {
+  return {handle.index(), handle.generation(), handle.epoch()};
+}
+
+OrderBookStorage::OrderHandle OrderBookStorage::to_handle(
+    NodeLink link) const noexcept {
+  return OrderHandle::from_raw_parts(&order_pool_, link.index, link.generation,
+                                     link.epoch);
+}
+
+OrderBookStorage::OrderRecord* OrderBookStorage::get(NodeLink link) noexcept {
+  return link.is_invalid() ? nullptr : order_pool_.get(to_handle(link));
+}
+
+const OrderBookStorage::OrderRecord* OrderBookStorage::get(
+    NodeLink link) const noexcept {
+  return link.is_invalid() ? nullptr : order_pool_.get(to_handle(link));
+}
+
+std::size_t OrderBookStorage::find_level_position(
+    const PriceLevel* levels, std::size_t count, Side side,
+    PriceTicks price) const noexcept {
+  std::size_t first = 0;
+  std::size_t last = count;
+  while (first < last) {
+    const auto middle = first + (last - first) / 2;
+    const bool before = side == Side::Buy ? levels[middle].price > price
+                                          : levels[middle].price < price;
+    if (before) {
+      first = middle + 1;
+    } else {
+      last = middle;
+    }
+  }
+  return first;
+}
+
+OrderBookStorage::PriceLevel* OrderBookStorage::find_level(
+    Side side, PriceTicks price) noexcept {
+  PriceLevel* levels = side == Side::Buy ? bids_.get() : asks_.get();
+  const auto count = side == Side::Buy ? bid_level_count_ : ask_level_count_;
+  if (side != Side::Buy && side != Side::Sell) {
+    return nullptr;
+  }
+  const auto position = find_level_position(levels, count, side, price);
+  return position < count && levels[position].price == price
+             ? &levels[position]
+             : nullptr;
+}
+
+const OrderBookStorage::PriceLevel* OrderBookStorage::find_level(
+    Side side, PriceTicks price) const noexcept {
+  const PriceLevel* levels = side == Side::Buy ? bids_.get() : asks_.get();
+  const auto count = side == Side::Buy ? bid_level_count_ : ask_level_count_;
+  if (side != Side::Buy && side != Side::Sell) {
+    return nullptr;
+  }
+  const auto position = find_level_position(levels, count, side, price);
+  return position < count && levels[position].price == price
+             ? &levels[position]
+             : nullptr;
+}
+
+OrderBookStorage::PriceLevel& OrderBookStorage::create_level(
+    Side side, PriceTicks price) noexcept {
+  PriceLevel* levels = side == Side::Buy ? bids_.get() : asks_.get();
+  std::size_t& count = side == Side::Buy ? bid_level_count_ : ask_level_count_;
+  std::size_t& high_water = side == Side::Buy
+                                ? bid_level_high_water_count_
+                                : ask_level_high_water_count_;
+  if (count >= price_level_capacity_per_side_) {
+    fail_storage_invariant();
+  }
+  const auto position = find_level_position(levels, count, side, price);
+  for (std::size_t index = count; index > position; --index) {
+    levels[index] = levels[index - 1];
+  }
+  levels[position] = PriceLevel{price};
+  ++count;
+  high_water = std::max(high_water, count);
+  return levels[position];
+}
+
+void OrderBookStorage::erase_level(Side side, std::size_t position) noexcept {
+  PriceLevel* levels = side == Side::Buy ? bids_.get() : asks_.get();
+  std::size_t& count = side == Side::Buy ? bid_level_count_ : ask_level_count_;
+  if (position >= count) {
+    fail_storage_invariant();
+  }
+  for (std::size_t index = position + 1; index < count; ++index) {
+    levels[index - 1] = levels[index];
+  }
+  --count;
+  levels[count] = {};
+}
+
+void OrderBookStorage::append_to_level(PriceLevel& level,
+                                       NodeLink link) noexcept {
+  OrderRecord* order = get(link);
+  if (order == nullptr) {
+    fail_storage_invariant();
+  }
+  order->previous = level.tail;
+  order->next = {};
+  if (level.tail.is_invalid()) {
+    level.head = link;
+  } else {
+    OrderRecord* tail = get(level.tail);
+    if (tail == nullptr) {
+      fail_storage_invariant();
+    }
+    tail->next = link;
+  }
+  level.tail = link;
+  ++level.order_count;
+}
+
+void OrderBookStorage::unlink_from_level(PriceLevel& level,
+                                          NodeLink link) noexcept {
+  OrderRecord* order = get(link);
+  if (order == nullptr || level.order_count == 0) {
+    fail_storage_invariant();
+  }
+  if (order->previous.is_invalid()) {
+    level.head = order->next;
+  } else {
+    OrderRecord* previous = get(order->previous);
+    if (previous == nullptr) {
+      fail_storage_invariant();
+    }
+    previous->next = order->next;
+  }
+  if (order->next.is_invalid()) {
+    level.tail = order->previous;
+  } else {
+    OrderRecord* next = get(order->next);
+    if (next == nullptr) {
+      fail_storage_invariant();
+    }
+    next->previous = order->previous;
+  }
+  order->previous = {};
+  order->next = {};
+  --level.order_count;
 }
 
 OrderBookResult OrderBookStorage::insert_resting(
     OrderId order_id, InstrumentId instrument_id, Side side, PriceTicks price,
-    Quantity leaves_quantity) {
+    Quantity leaves_quantity) noexcept {
   if (!instrument_id_.is_valid() || instrument_id != instrument_id_) {
     return OrderBookResult::InvalidInstrument;
   }
-  if (!order_id.is_valid()) {
+  if (!order_id.is_valid() || orders_.find(order_id) != nullptr) {
     return OrderBookResult::DuplicateOrderId;
   }
   if (side != Side::Buy && side != Side::Sell) {
@@ -44,288 +336,212 @@ OrderBookResult OrderBookStorage::insert_resting(
   if (!leaves_quantity.is_valid()) {
     return OrderBookResult::InvalidQuantity;
   }
-  if (orders_.contains(order_id)) {
-    return OrderBookResult::DuplicateOrderId;
-  }
-  if (orders_.size() >= active_order_capacity_) {
+  if (orders_.size() >= active_order_capacity_ ||
+      order_pool_.next_acquire_status() != PoolAcquireStatus::Acquired) {
     return OrderBookResult::CapacityExhausted;
   }
 
-  const OrderRecord order{order_id, instrument_id, side, price, leaves_quantity};
-  if (side == Side::Buy) {
-    const auto existing_level = bids_.find(price);
-    if (existing_level == bids_.end()) {
-      if (bids_.size() >= price_level_capacity_per_side_) {
-        return OrderBookResult::CapacityExhausted;
-      }
-      return insert_bid(order, leaves_quantity);
-    }
-
-    const auto aggregate =
-        checked_add(existing_level->second.aggregate_leaves_quantity,
-                    leaves_quantity);
-    if (!aggregate.has_value()) {
+  PriceLevel* destination = find_level(side, price);
+  Quantity aggregate = leaves_quantity;
+  if (destination == nullptr) {
+    if (price_level_count(side) >= price_level_capacity_per_side_) {
       return OrderBookResult::CapacityExhausted;
     }
-    return insert_bid(order, aggregate.value);
-  }
-
-  const auto existing_level = asks_.find(price);
-  if (existing_level == asks_.end()) {
-    if (asks_.size() >= price_level_capacity_per_side_) {
+  } else {
+    const auto sum = checked_add(destination->aggregate_leaves_quantity,
+                                 leaves_quantity);
+    if (!sum.has_value()) {
       return OrderBookResult::CapacityExhausted;
     }
-    return insert_ask(order, leaves_quantity);
+    aggregate = sum.value;
   }
 
-  const auto aggregate =
-      checked_add(existing_level->second.aggregate_leaves_quantity,
-                  leaves_quantity);
-  if (!aggregate.has_value()) {
-    return OrderBookResult::CapacityExhausted;
+  const auto acquired = order_pool_.acquire(OrderRecord{
+      order_id, instrument_id, side, price, leaves_quantity, {}, {}});
+  if (!acquired.acquired()) {
+    fail_storage_invariant();
   }
-  return insert_ask(order, aggregate.value);
-}
-
-OrderBookResult OrderBookStorage::insert_bid(OrderRecord order,
-                                             Quantity aggregate) {
-  auto [level, level_created] = bids_.try_emplace(order.price);
-  level->second.fifo.push_back(order);
-  const auto inserted_order = std::prev(level->second.fifo.end());
-  const auto [indexed_order, inserted] = orders_.emplace(
-      order.order_id,
-      OrderLocation{Side::Buy, order.price, inserted_order});
-  if (!inserted) {
-    level->second.fifo.erase(inserted_order);
-    if (level_created) {
-      bids_.erase(level);
-    }
-    return OrderBookResult::DuplicateOrderId;
+  const NodeLink link = to_link(acquired.handle);
+  if (!orders_.insert(order_id, link)) {
+    fail_storage_invariant();
   }
-  static_cast<void>(indexed_order);
-  level->second.aggregate_leaves_quantity = aggregate;
+  if (destination == nullptr) {
+    destination = &create_level(side, price);
+  }
+  append_to_level(*destination, link);
+  destination->aggregate_leaves_quantity = aggregate;
   return OrderBookResult::Accepted;
 }
 
-OrderBookResult OrderBookStorage::insert_ask(OrderRecord order,
-                                             Quantity aggregate) {
-  auto [level, level_created] = asks_.try_emplace(order.price);
-  level->second.fifo.push_back(order);
-  const auto inserted_order = std::prev(level->second.fifo.end());
-  const auto [indexed_order, inserted] = orders_.emplace(
-      order.order_id,
-      OrderLocation{Side::Sell, order.price, inserted_order});
-  if (!inserted) {
-    level->second.fifo.erase(inserted_order);
-    if (level_created) {
-      asks_.erase(level);
-    }
-    return OrderBookResult::DuplicateOrderId;
-  }
-  static_cast<void>(indexed_order);
-  level->second.aggregate_leaves_quantity = aggregate;
-  return OrderBookResult::Accepted;
-}
-
-OrderBookResult OrderBookStorage::remove_resting(OrderId order_id) {
-  const auto indexed_order = orders_.find(order_id);
-  if (indexed_order == orders_.end()) {
+OrderBookResult OrderBookStorage::remove_link(OrderId order_id,
+                                               NodeLink link) noexcept {
+  OrderRecord* order = get(link);
+  if (order == nullptr || order->order_id != order_id) {
     return OrderBookResult::OrderNotFound;
   }
-
-  if (indexed_order->second.side == Side::Buy) {
-    return remove_bid(indexed_order);
+  PriceLevel* price_level = find_level(order->side, order->price);
+  if (price_level == nullptr) {
+    return OrderBookResult::OrderNotFound;
   }
-  return remove_ask(indexed_order);
+  PriceLevel* levels = order->side == Side::Buy ? bids_.get() : asks_.get();
+  const Side side = order->side;
+  const auto level_position = static_cast<std::size_t>(price_level - levels);
+  const auto aggregate = checked_subtract(
+      price_level->aggregate_leaves_quantity, order->leaves_quantity);
+  if (aggregate.result != QuantityArithmeticResult::Success &&
+      aggregate.result != QuantityArithmeticResult::Zero) {
+    return OrderBookResult::InvalidQuantity;
+  }
+
+  unlink_from_level(*price_level, link);
+  if (!orders_.erase(order_id) ||
+      order_pool_.release(to_handle(link)) != PoolReleaseStatus::Released) {
+    fail_storage_invariant();
+  }
+  if (aggregate.result == QuantityArithmeticResult::Zero) {
+    if (price_level->order_count != 0) {
+      fail_storage_invariant();
+    }
+    erase_level(side, level_position);
+  } else {
+    price_level->aggregate_leaves_quantity = aggregate.value;
+  }
+  return OrderBookResult::Accepted;
+}
+
+OrderBookResult OrderBookStorage::remove_resting(OrderId order_id) noexcept {
+  const NodeLink* link = orders_.find(order_id);
+  return link == nullptr ? OrderBookResult::OrderNotFound
+                         : remove_link(order_id, *link);
 }
 
 OrderBookResult OrderBookStorage::reduce_resting_by(
     OrderId order_id, Quantity reduction) noexcept {
-  const auto indexed_order = orders_.find(order_id);
-  if (indexed_order == orders_.end()) {
+  const NodeLink* link = orders_.find(order_id);
+  OrderRecord* order = link == nullptr ? nullptr : get(*link);
+  if (order == nullptr) {
     return OrderBookResult::OrderNotFound;
   }
-  if (!reduction.is_valid() ||
-      reduction > indexed_order->second.order->leaves_quantity) {
+  if (!reduction.is_valid() || reduction > order->leaves_quantity) {
     return OrderBookResult::InvalidQuantity;
   }
-  if (reduction == indexed_order->second.order->leaves_quantity) {
-    return remove_resting(order_id);
+  if (reduction == order->leaves_quantity) {
+    return remove_link(order_id, *link);
   }
-
-  const auto new_leaves = checked_subtract(
-      indexed_order->second.order->leaves_quantity, reduction);
-  if (!new_leaves.has_value()) {
+  const auto new_leaves = checked_subtract(order->leaves_quantity, reduction);
+  PriceLevel* price_level = find_level(order->side, order->price);
+  if (!new_leaves.has_value() || price_level == nullptr) {
     return OrderBookResult::InvalidQuantity;
   }
-
-  if (indexed_order->second.side == Side::Buy) {
-    const auto level = bids_.find(indexed_order->second.price);
-    if (level == bids_.end()) {
-      return OrderBookResult::OrderNotFound;
-    }
-    const auto aggregate =
-        checked_subtract(level->second.aggregate_leaves_quantity, reduction);
-    if (!aggregate.has_value()) {
-      return OrderBookResult::InvalidQuantity;
-    }
-    indexed_order->second.order->leaves_quantity = new_leaves.value;
-    level->second.aggregate_leaves_quantity = aggregate.value;
-    return OrderBookResult::Accepted;
-  }
-
-  const auto level = asks_.find(indexed_order->second.price);
-  if (level == asks_.end()) {
-    return OrderBookResult::OrderNotFound;
-  }
-  const auto aggregate =
-      checked_subtract(level->second.aggregate_leaves_quantity, reduction);
+  const auto aggregate = checked_subtract(
+      price_level->aggregate_leaves_quantity, reduction);
   if (!aggregate.has_value()) {
     return OrderBookResult::InvalidQuantity;
   }
-  indexed_order->second.order->leaves_quantity = new_leaves.value;
-  level->second.aggregate_leaves_quantity = aggregate.value;
+  order->leaves_quantity = new_leaves.value;
+  price_level->aggregate_leaves_quantity = aggregate.value;
   return OrderBookResult::Accepted;
 }
 
 OrderBookResult OrderBookStorage::update_resting_leaves(
     OrderId order_id, Quantity new_leaves_quantity) noexcept {
-  const auto indexed_order = orders_.find(order_id);
-  if (indexed_order == orders_.end()) {
+  const NodeLink* link = orders_.find(order_id);
+  OrderRecord* order = link == nullptr ? nullptr : get(*link);
+  if (order == nullptr) {
     return OrderBookResult::OrderNotFound;
   }
   if (!new_leaves_quantity.is_valid()) {
     return OrderBookResult::InvalidQuantity;
   }
-
-  const auto old_leaves = indexed_order->second.order->leaves_quantity;
-  if (new_leaves_quantity == old_leaves) {
+  if (new_leaves_quantity == order->leaves_quantity) {
     return OrderBookResult::Accepted;
   }
-
-  const auto update_level = [&](auto& levels) noexcept {
-    const auto level = levels.find(indexed_order->second.price);
-    if (level == levels.end()) {
-      return OrderBookResult::OrderNotFound;
-    }
-
-    CheckedQuantity new_aggregate;
-    if (new_leaves_quantity < old_leaves) {
-      const auto reduction = checked_subtract(old_leaves, new_leaves_quantity);
-      if (!reduction.has_value()) {
-        return OrderBookResult::InvalidQuantity;
-      }
-      new_aggregate = checked_subtract(
-          level->second.aggregate_leaves_quantity, reduction.value);
-      if (!new_aggregate.has_value()) {
-        return OrderBookResult::InvalidQuantity;
-      }
-    } else {
-      const auto increase = checked_subtract(new_leaves_quantity, old_leaves);
-      if (!increase.has_value()) {
-        return OrderBookResult::InvalidQuantity;
-      }
-      new_aggregate = checked_add(level->second.aggregate_leaves_quantity,
-                                  increase.value);
-      if (!new_aggregate.has_value()) {
-        return OrderBookResult::CapacityExhausted;
-      }
-    }
-
-    indexed_order->second.order->leaves_quantity = new_leaves_quantity;
-    level->second.aggregate_leaves_quantity = new_aggregate.value;
-    return OrderBookResult::Accepted;
-  };
-
-  if (indexed_order->second.side == Side::Buy) {
-    return update_level(bids_);
+  PriceLevel* price_level = find_level(order->side, order->price);
+  if (price_level == nullptr) {
+    return OrderBookResult::OrderNotFound;
   }
-  if (indexed_order->second.side == Side::Sell) {
-    return update_level(asks_);
+
+  CheckedQuantity aggregate;
+  if (new_leaves_quantity < order->leaves_quantity) {
+    const auto reduction = checked_subtract(order->leaves_quantity,
+                                            new_leaves_quantity);
+    if (!reduction.has_value()) {
+      return OrderBookResult::InvalidQuantity;
+    }
+    aggregate = checked_subtract(price_level->aggregate_leaves_quantity,
+                                 reduction.value);
+    if (!aggregate.has_value()) {
+      return OrderBookResult::InvalidQuantity;
+    }
+  } else {
+    const auto increase = checked_subtract(new_leaves_quantity,
+                                           order->leaves_quantity);
+    if (!increase.has_value()) {
+      return OrderBookResult::InvalidQuantity;
+    }
+    aggregate = checked_add(price_level->aggregate_leaves_quantity,
+                            increase.value);
+    if (!aggregate.has_value()) {
+      return OrderBookResult::CapacityExhausted;
+    }
   }
-  return OrderBookResult::OrderNotFound;
+  order->leaves_quantity = new_leaves_quantity;
+  price_level->aggregate_leaves_quantity = aggregate.value;
+  return OrderBookResult::Accepted;
 }
 
 OrderBookResult OrderBookStorage::move_resting_to_back(
     OrderId order_id) noexcept {
-  const auto indexed_order = orders_.find(order_id);
-  if (indexed_order == orders_.end()) {
+  const NodeLink* indexed = orders_.find(order_id);
+  if (indexed == nullptr) {
     return OrderBookResult::OrderNotFound;
   }
-
-  const auto move_in_level = [&](auto& levels) noexcept {
-    const auto level = levels.find(indexed_order->second.price);
-    if (level == levels.end()) {
-      return OrderBookResult::OrderNotFound;
-    }
-    level->second.fifo.splice(level->second.fifo.end(), level->second.fifo,
-                              indexed_order->second.order);
+  const NodeLink link = *indexed;
+  OrderRecord* order = get(link);
+  if (order == nullptr) {
+    return OrderBookResult::OrderNotFound;
+  }
+  PriceLevel* price_level = find_level(order->side, order->price);
+  if (price_level == nullptr) {
+    return OrderBookResult::OrderNotFound;
+  }
+  if (price_level->tail == link) {
     return OrderBookResult::Accepted;
-  };
+  }
+  unlink_from_level(*price_level, link);
+  append_to_level(*price_level, link);
+  return OrderBookResult::Accepted;
+}
 
-  if (indexed_order->second.side == Side::Buy) {
-    return move_in_level(bids_);
+bool OrderBookStorage::can_insert_after_removing(
+    std::optional<OrderId> first_removed_order) const noexcept {
+  if (order_pool_.free_count() != 0) {
+    return order_pool_.next_acquire_status() == PoolAcquireStatus::Acquired;
   }
-  if (indexed_order->second.side == Side::Sell) {
-    return move_in_level(asks_);
+  if (!first_removed_order) {
+    return false;
   }
-  return OrderBookResult::OrderNotFound;
+  const NodeLink* link = orders_.find(*first_removed_order);
+  return link != nullptr &&
+         order_pool_.acquire_status_after_release(to_handle(*link)) ==
+             PoolAcquireStatus::Acquired;
+}
+
+bool OrderBookStorage::can_clear() const noexcept {
+  return order_pool_.can_reset();
 }
 
 void OrderBookStorage::clear() noexcept {
+  if (!can_clear()) {
+    fail_storage_invariant();
+  }
   orders_.clear();
-  bids_.clear();
-  asks_.clear();
-}
-
-OrderBookResult OrderBookStorage::remove_bid(
-    OrderIndex::iterator indexed_order) {
-  const auto level = bids_.find(indexed_order->second.price);
-  if (level == bids_.end()) {
-    return OrderBookResult::OrderNotFound;
+  bid_level_count_ = 0;
+  ask_level_count_ = 0;
+  const auto reset = order_pool_.reset();
+  if (reset != PoolResetStatus::Reset) {
+    fail_storage_invariant();
   }
-
-  const auto leaves = indexed_order->second.order->leaves_quantity;
-  const auto aggregate =
-      checked_subtract(level->second.aggregate_leaves_quantity, leaves);
-  if (aggregate.result != QuantityArithmeticResult::Success &&
-      aggregate.result != QuantityArithmeticResult::Zero) {
-    return OrderBookResult::InvalidQuantity;
-  }
-
-  level->second.fifo.erase(indexed_order->second.order);
-  orders_.erase(indexed_order);
-  if (aggregate.result == QuantityArithmeticResult::Zero) {
-    bids_.erase(level);
-  } else {
-    level->second.aggregate_leaves_quantity = aggregate.value;
-  }
-  return OrderBookResult::Accepted;
-}
-
-OrderBookResult OrderBookStorage::remove_ask(
-    OrderIndex::iterator indexed_order) {
-  const auto level = asks_.find(indexed_order->second.price);
-  if (level == asks_.end()) {
-    return OrderBookResult::OrderNotFound;
-  }
-
-  const auto leaves = indexed_order->second.order->leaves_quantity;
-  const auto aggregate =
-      checked_subtract(level->second.aggregate_leaves_quantity, leaves);
-  if (aggregate.result != QuantityArithmeticResult::Success &&
-      aggregate.result != QuantityArithmeticResult::Zero) {
-    return OrderBookResult::InvalidQuantity;
-  }
-
-  level->second.fifo.erase(indexed_order->second.order);
-  orders_.erase(indexed_order);
-  if (aggregate.result == QuantityArithmeticResult::Zero) {
-    asks_.erase(level);
-  } else {
-    level->second.aggregate_leaves_quantity = aggregate.value;
-  }
-  return OrderBookResult::Accepted;
 }
 
 InstrumentId OrderBookStorage::instrument_id() const noexcept {
@@ -338,12 +554,9 @@ std::size_t OrderBookStorage::active_order_count() const noexcept {
 
 std::size_t OrderBookStorage::price_level_count(Side side) const noexcept {
   if (side == Side::Buy) {
-    return bids_.size();
+    return bid_level_count_;
   }
-  if (side == Side::Sell) {
-    return asks_.size();
-  }
-  return 0;
+  return side == Side::Sell ? ask_level_count_ : 0;
 }
 
 std::size_t OrderBookStorage::active_order_capacity() const noexcept {
@@ -354,208 +567,186 @@ std::size_t OrderBookStorage::price_level_capacity_per_side() const noexcept {
   return price_level_capacity_per_side_;
 }
 
+StorageDiagnostics OrderBookStorage::diagnostics() const noexcept {
+  const auto level_bytes =
+      2 * physical_capacity(price_level_capacity_per_side_) *
+      sizeof(PriceLevel);
+  const auto pool_bytes = order_pool_.backing_memory_bytes();
+  const auto index_bytes = orders_.backing_memory_bytes();
+  return {active_order_capacity_,
+          order_pool_.used_count(),
+          order_pool_.free_count(),
+          order_pool_.high_water_count(),
+          bid_level_high_water_count_,
+          ask_level_high_water_count_,
+          orders_.capacity(),
+          sizeof(OrderRecord),
+          alignof(OrderRecord),
+          OrderPool::slot_size_bytes(),
+          OrderPool::slot_alignment_bytes(),
+          order_pool_.slot_backing_memory_bytes(),
+          order_pool_.free_index_backing_memory_bytes(),
+          pool_bytes,
+          index_bytes,
+          level_bytes,
+          pool_bytes + index_bytes + level_bytes};
+}
+
 std::optional<RestingOrderView> OrderBookStorage::find_order(
     OrderId order_id) const noexcept {
-  const auto order = orders_.find(order_id);
-  if (order == orders_.end()) {
+  const NodeLink* link = orders_.find(order_id);
+  const OrderRecord* order = link == nullptr ? nullptr : get(*link);
+  if (order == nullptr) {
     return std::nullopt;
   }
-
-  const auto& record = *order->second.order;
-  return make_view(record.order_id, record.instrument_id, record.side,
-                   record.price, record.leaves_quantity);
+  return make_view(order->order_id, order->instrument_id, order->side,
+                   order->price, order->leaves_quantity);
 }
 
 std::optional<PriceTicks> OrderBookStorage::best_bid() const noexcept {
-  if (bids_.empty()) {
-    return std::nullopt;
-  }
-  return bids_.begin()->first;
+  return bid_level_count_ == 0 ? std::nullopt
+                               : std::optional<PriceTicks>{bids_[0].price};
 }
 
 std::optional<PriceTicks> OrderBookStorage::best_ask() const noexcept {
-  if (asks_.empty()) {
-    return std::nullopt;
-  }
-  return asks_.begin()->first;
+  return ask_level_count_ == 0 ? std::nullopt
+                               : std::optional<PriceTicks>{asks_[0].price};
 }
 
 std::optional<DepthEntry> OrderBookStorage::level(
     Side side, PriceTicks price) const noexcept {
-  if (side == Side::Buy) {
-    return bid_level(price);
-  }
-  if (side == Side::Sell) {
-    return ask_level(price);
-  }
-  return std::nullopt;
-}
-
-std::optional<DepthEntry> OrderBookStorage::bid_level(
-    PriceTicks price) const noexcept {
-  const auto level = bids_.find(price);
-  if (level == bids_.end()) {
-    return std::nullopt;
-  }
-  return DepthEntry{level->first, level->second.aggregate_leaves_quantity,
-                    level->second.fifo.size()};
-}
-
-std::optional<DepthEntry> OrderBookStorage::ask_level(
-    PriceTicks price) const noexcept {
-  const auto level = asks_.find(price);
-  if (level == asks_.end()) {
-    return std::nullopt;
-  }
-  return DepthEntry{level->first, level->second.aggregate_leaves_quantity,
-                    level->second.fifo.size()};
+  const PriceLevel* found = find_level(side, price);
+  return found == nullptr
+             ? std::nullopt
+             : std::optional<DepthEntry>{{found->price,
+                                          found->aggregate_leaves_quantity,
+                                          found->order_count}};
 }
 
 std::vector<DepthEntry> OrderBookStorage::depth(Side side) const {
   std::vector<DepthEntry> result;
-  result.reserve(price_level_count(side));
-  if (side == Side::Buy) {
-    for (const auto& [price, level_data] : bids_) {
-      result.push_back(
-          {price, level_data.aggregate_leaves_quantity, level_data.fifo.size()});
+  const PriceLevel* levels = side == Side::Buy ? bids_.get() : asks_.get();
+  const auto count = price_level_count(side);
+  result.reserve(count);
+  for (std::size_t index = 0; index < count; ++index) {
+    result.push_back({levels[index].price,
+                      levels[index].aggregate_leaves_quantity,
+                      levels[index].order_count});
+  }
+  return result;
+}
+
+std::vector<RestingOrderView> OrderBookStorage::level_orders(
+    Side side, PriceTicks price) const {
+  std::vector<RestingOrderView> result;
+  const PriceLevel* price_level = find_level(side, price);
+  if (price_level == nullptr) {
+    return result;
+  }
+  result.reserve(price_level->order_count);
+  NodeLink link = price_level->head;
+  while (!link.is_invalid()) {
+    const OrderRecord* order = get(link);
+    if (order == nullptr) {
+      fail_storage_invariant();
     }
-  } else if (side == Side::Sell) {
-    for (const auto& [price, level_data] : asks_) {
-      result.push_back(
-          {price, level_data.aggregate_leaves_quantity, level_data.fifo.size()});
-    }
+    result.push_back(make_view(order->order_id, order->instrument_id,
+                               order->side, order->price,
+                               order->leaves_quantity));
+    link = order->next;
   }
   return result;
 }
 
 std::vector<RestingOrderView> OrderBookStorage::orders_at_level(
     Side side, PriceTicks price) const {
-  if (side == Side::Buy) {
-    return bid_orders(price);
-  }
-  if (side == Side::Sell) {
-    return ask_orders(price);
-  }
-  return {};
-}
-
-std::vector<RestingOrderView> OrderBookStorage::bid_orders(
-    PriceTicks price) const {
-  std::vector<RestingOrderView> result;
-  const auto level = bids_.find(price);
-  if (level == bids_.end()) {
-    return result;
-  }
-
-  result.reserve(level->second.fifo.size());
-  for (const auto& order : level->second.fifo) {
-    result.push_back(make_view(order.order_id, order.instrument_id, order.side,
-                               order.price, order.leaves_quantity));
-  }
-  return result;
-}
-
-std::vector<RestingOrderView> OrderBookStorage::ask_orders(
-    PriceTicks price) const {
-  std::vector<RestingOrderView> result;
-  const auto level = asks_.find(price);
-  if (level == asks_.end()) {
-    return result;
-  }
-
-  result.reserve(level->second.fifo.size());
-  for (const auto& order : level->second.fifo) {
-    result.push_back(make_view(order.order_id, order.instrument_id, order.side,
-                               order.price, order.leaves_quantity));
-  }
-  return result;
+  return side == Side::Buy || side == Side::Sell
+             ? level_orders(side, price)
+             : std::vector<RestingOrderView>{};
 }
 
 #ifndef NDEBUG
 bool OrderBookStorage::validate_invariants() const noexcept {
   if (orders_.size() > active_order_capacity_ ||
-      bids_.size() > price_level_capacity_per_side_ ||
-      asks_.size() > price_level_capacity_per_side_) {
+      bid_level_count_ > price_level_capacity_per_side_ ||
+      ask_level_count_ > price_level_capacity_per_side_ ||
+      order_pool_.used_count() != orders_.size() ||
+      order_pool_.used_count() + order_pool_.free_count() !=
+          order_pool_.capacity() ||
+      order_pool_.high_water_count() < order_pool_.used_count() ||
+      bid_level_high_water_count_ < bid_level_count_ ||
+      ask_level_high_water_count_ < ask_level_count_ ||
+      !orders_.validate_invariants() || !order_pool_.validate_invariants()) {
     return false;
   }
 
   std::size_t reachable_orders = 0;
-  auto validate_side = [this, &reachable_orders](const auto& levels,
-                                                 Side expected_side) noexcept {
-    bool first_level = true;
-    PriceTicks previous_price{};
-    for (const auto& [price, level_data] : levels) {
-      if (!price.is_valid() || level_data.fifo.empty() ||
-          !level_data.aggregate_leaves_quantity.is_valid()) {
+  const auto validate_side = [&](const PriceLevel* levels, std::size_t count,
+                                 Side expected_side) noexcept {
+    for (std::size_t level_index = 0; level_index < count; ++level_index) {
+      const PriceLevel& price_level = levels[level_index];
+      if (!price_level.price.is_valid() ||
+          !price_level.aggregate_leaves_quantity.is_valid() ||
+          price_level.order_count == 0 || price_level.head.is_invalid() ||
+          price_level.tail.is_invalid()) {
         return false;
       }
-      if (!first_level) {
-        if (expected_side == Side::Buy && !(previous_price > price)) {
-          return false;
-        }
-        if (expected_side == Side::Sell && !(previous_price < price)) {
+      if (level_index != 0) {
+        const bool ordered = expected_side == Side::Buy
+                                 ? levels[level_index - 1].price >
+                                       price_level.price
+                                 : levels[level_index - 1].price <
+                                       price_level.price;
+        if (!ordered) {
           return false;
         }
       }
-      first_level = false;
-      previous_price = price;
 
       std::uint64_t aggregate = 0;
-      for (auto order = level_data.fifo.begin(); order != level_data.fifo.end();
-           ++order) {
-        if (!order->order_id.is_valid() || order->instrument_id != instrument_id_ ||
-            order->side != expected_side || order->price != price ||
-            !order->leaves_quantity.is_valid()) {
+      std::size_t order_count = 0;
+      NodeLink previous{};
+      NodeLink link = price_level.head;
+      while (!link.is_invalid()) {
+        const OrderRecord* order = get(link);
+        if (order == nullptr || order->previous != previous ||
+            !order->order_id.is_valid() ||
+            order->instrument_id != instrument_id_ ||
+            order->side != expected_side || order->price != price_level.price ||
+            !order->leaves_quantity.is_valid() ||
+            order->leaves_quantity.value() >
+                Quantity::maximum_value - aggregate) {
           return false;
         }
-        if (order->leaves_quantity.value() >
-            Quantity::maximum_value - aggregate) {
+        const NodeLink* indexed = orders_.find(order->order_id);
+        if (indexed == nullptr || *indexed != link) {
           return false;
         }
         aggregate += order->leaves_quantity.value();
-
-        const auto indexed_order = orders_.find(order->order_id);
-        if (indexed_order == orders_.end() ||
-            indexed_order->second.side != expected_side ||
-            indexed_order->second.price != price ||
-            std::addressof(*indexed_order->second.order) !=
-                std::addressof(*order)) {
+        ++order_count;
+        ++reachable_orders;
+        if (order_count > orders_.size()) {
           return false;
         }
-        ++reachable_orders;
+        previous = link;
+        link = order->next;
       }
-      if (aggregate != level_data.aggregate_leaves_quantity.value()) {
+      if (previous != price_level.tail || order_count != price_level.order_count ||
+          aggregate != price_level.aggregate_leaves_quantity.value()) {
         return false;
       }
     }
     return true;
   };
 
-  if (!validate_side(bids_, Side::Buy) ||
-      !validate_side(asks_, Side::Sell) ||
+  if (!validate_side(bids_.get(), bid_level_count_, Side::Buy) ||
+      !validate_side(asks_.get(), ask_level_count_, Side::Sell) ||
       reachable_orders != orders_.size()) {
     return false;
   }
-
-  for (const auto& [order_id, location] : orders_) {
-    if (location.order->order_id != order_id ||
-        location.order->side != location.side ||
-        location.order->price != location.price) {
-      return false;
-    }
-  }
-
-  if (bids_.empty() != !best_bid().has_value() ||
-      asks_.empty() != !best_ask().has_value()) {
+  if ((bid_level_count_ == 0) != !best_bid().has_value() ||
+      (ask_level_count_ == 0) != !best_ask().has_value()) {
     return false;
   }
-  if (!bids_.empty() && best_bid() != std::optional<PriceTicks>{bids_.begin()->first}) {
-    return false;
-  }
-  if (!asks_.empty() && best_ask() != std::optional<PriceTicks>{asks_.begin()->first}) {
-    return false;
-  }
-
   return true;
 }
 #endif
