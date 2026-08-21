@@ -106,6 +106,12 @@ void test_deterministic_order_and_exhaustion(Checks& checks) {
   checks.require(pool.used_count() == 4 && pool.free_count() == 0 &&
                      pool.high_water_count() == 4,
                  "exhaustion leaves counters unchanged");
+  checks.require(pool.acquire_status_after_release(handles[1]) ==
+                     lob::PoolAcquireStatus::Acquired,
+                 "full-pool release preflight identifies reusable slot");
+  checks.require(pool.acquire_status_after_release(Pool::Handle{}) ==
+                     lob::PoolAcquireStatus::Exhausted,
+                 "invalid planned release cannot satisfy preflight");
 
   constexpr std::array<std::size_t, 4> release_order{1, 3, 0, 2};
   for (const auto index : release_order) {
@@ -299,6 +305,9 @@ void test_generation_and_epoch_exhaustion_policy(Checks& checks) {
                      std::array{pool.used_count(), pool.free_count(),
                                 pool.high_water_count()},
                  "generation exhaustion is non-mutating");
+  checks.require(pool.next_acquire_status() ==
+                     lob::PoolAcquireStatus::GenerationExhausted,
+                 "generation exhaustion is visible to reservation preflight");
   checks.require(pool.get(first) == nullptr && pool.get(last) == nullptr,
                  "released generations remain stale");
 

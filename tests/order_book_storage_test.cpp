@@ -7,6 +7,35 @@
 #include <utility>
 #include <vector>
 
+namespace lob {
+
+struct OrderBookStorageTestAccess final {
+  struct Identity final {
+    std::uint32_t index{};
+    std::uint64_t generation{};
+    std::uint64_t epoch{};
+
+    constexpr bool operator==(const Identity&) const noexcept = default;
+  };
+
+  [[nodiscard]] static std::optional<Identity> identity(
+      const OrderBookStorage& book, OrderId order_id) noexcept {
+    const auto* link = book.orders_.find(order_id);
+    if (link == nullptr) {
+      return std::nullopt;
+    }
+    return Identity{link->index, link->generation, link->epoch};
+  }
+
+  [[nodiscard]] static bool valid(const OrderBookStorage& book,
+                                  Identity identity) noexcept {
+    return book.get(OrderBookStorage::NodeLink{
+               identity.index, identity.generation, identity.epoch}) != nullptr;
+  }
+};
+
+}  // namespace lob
+
 namespace {
 
 using lob::DepthEntry;
@@ -19,6 +48,7 @@ using lob::Quantity;
 using lob::RestingOrderView;
 using lob::Side;
 using lob::StorageLimits;
+using lob::OrderBookStorageTestAccess;
 
 static_assert(!std::is_reference_v<decltype(
               std::declval<const OrderBookStorage&>().find_order(OrderId{}))>);
@@ -528,6 +558,122 @@ void test_clear_releases_all_logical_state(Checks& checks) {
   require_invariants(checks, book);
 }
 
+void test_pool_identity_counters_and_reset(Checks& checks) {
+  const auto instrument = instrument_id(checks, 16);
+  const auto first = order_id(checks, 1);
+  const auto second = order_id(checks, 2);
+  const auto third = order_id(checks, 3);
+  const auto level_price = price(checks, 100);
+  OrderBookStorage book(instrument, StorageLimits{2, 2});
+
+  auto diagnostics = book.diagnostics();
+  checks.require(diagnostics.configured_active_order_capacity == 2 &&
+                 diagnostics.pool_used_count == 0 &&
+                 diagnostics.pool_free_count == 2 &&
+                 diagnostics.pool_high_water_count == 0 &&
+                 diagnostics.total_configured_storage_bytes ==
+                     diagnostics.pool_backing_bytes +
+                         diagnostics.active_index_backing_bytes +
+                         diagnostics.price_level_backing_bytes);
+
+  checks.require(book.insert_resting(first, instrument, Side::Buy, level_price,
+                                     quantity(checks, 10)) ==
+                 OrderBookResult::Accepted);
+  checks.require(book.insert_resting(second, instrument, Side::Buy,
+                                     level_price, quantity(checks, 20)) ==
+                 OrderBookResult::Accepted);
+  const auto first_identity = OrderBookStorageTestAccess::identity(book, first);
+  const auto second_identity =
+      OrderBookStorageTestAccess::identity(book, second);
+  checks.require(first_identity.has_value() && second_identity.has_value() &&
+                 first_identity != second_identity);
+
+  checks.require(book.reduce_resting_by(first, quantity(checks, 1)) ==
+                 OrderBookResult::Accepted);
+  checks.require(OrderBookStorageTestAccess::identity(book, first) ==
+                 first_identity);
+  checks.require(book.update_resting_leaves(first, quantity(checks, 15)) ==
+                 OrderBookResult::Accepted);
+  checks.require(book.move_resting_to_back(first) == OrderBookResult::Accepted);
+  checks.require(OrderBookStorageTestAccess::identity(book, first) ==
+                 first_identity);
+  checks.require(fifo_ids(book.orders_at_level(Side::Buy, level_price)) ==
+                 std::vector<OrderId>{second, first});
+
+  diagnostics = book.diagnostics();
+  checks.require(diagnostics.pool_used_count == 2 &&
+                 diagnostics.pool_free_count == 0 &&
+                 diagnostics.pool_high_water_count == 2 &&
+                 diagnostics.bid_level_high_water_count == 1);
+  checks.require(book.remove_resting(first) == OrderBookResult::Accepted);
+  checks.require(!OrderBookStorageTestAccess::valid(book, *first_identity));
+  checks.require(book.insert_resting(third, instrument, Side::Buy, level_price,
+                                     quantity(checks, 30)) ==
+                 OrderBookResult::Accepted);
+  const auto third_identity = OrderBookStorageTestAccess::identity(book, third);
+  checks.require(third_identity.has_value() &&
+                 third_identity->index == first_identity->index &&
+                 third_identity->generation != first_identity->generation &&
+                 !OrderBookStorageTestAccess::valid(book, *first_identity));
+
+  const auto pre_reset_identity = *third_identity;
+  book.clear();
+  diagnostics = book.diagnostics();
+  checks.require(diagnostics.pool_used_count == 0 &&
+                 diagnostics.pool_free_count == 2 &&
+                 diagnostics.pool_high_water_count == 2 &&
+                 diagnostics.bid_level_high_water_count == 1 &&
+                 !OrderBookStorageTestAccess::valid(book,
+                                                    pre_reset_identity));
+  checks.require(book.insert_resting(first, instrument, Side::Sell,
+                                     price(checks, 101), quantity(checks, 1)) ==
+                 OrderBookResult::Accepted);
+  const auto post_reset_identity =
+      OrderBookStorageTestAccess::identity(book, first);
+  checks.require(post_reset_identity.has_value() &&
+                 post_reset_identity->index == 0 &&
+                 post_reset_identity->epoch != pre_reset_identity.epoch);
+  require_invariants(checks, book);
+}
+
+void test_production_pool_capacity(Checks& checks) {
+  const auto instrument = instrument_id(checks, 17);
+  const auto level_price = price(checks, 100);
+  const auto one = quantity(checks, 1);
+  OrderBookStorage book(instrument);
+  for (std::size_t index = 0; index < lob::kMaximumActiveOrders; ++index) {
+    const auto id = order_id(checks, static_cast<std::uint64_t>(index) + 1);
+    if (book.insert_resting(id, instrument, Side::Buy, level_price, one) !=
+        OrderBookResult::Accepted) {
+      checks.require(false);
+      return;
+    }
+  }
+  const auto before = book.diagnostics();
+  checks.require(before.pool_used_count == lob::kMaximumActiveOrders &&
+                 before.pool_free_count == 0 &&
+                 before.pool_high_water_count == lob::kMaximumActiveOrders);
+  checks.require(book.insert_resting(
+                     order_id(checks, lob::kMaximumActiveOrders + 1),
+                     instrument, Side::Buy, level_price, one) ==
+                 OrderBookResult::CapacityExhausted);
+  checks.require(book.diagnostics() == before);
+  checks.require(book.remove_resting(order_id(checks, 1)) ==
+                 OrderBookResult::Accepted);
+  checks.require(book.remove_resting(
+                     order_id(checks, lob::kMaximumActiveOrders)) ==
+                 OrderBookResult::Accepted);
+  checks.require(book.insert_resting(
+                     order_id(checks, lob::kMaximumActiveOrders + 1),
+                     instrument, Side::Buy, level_price, one) ==
+                 OrderBookResult::Accepted);
+  checks.require(book.insert_resting(
+                     order_id(checks, lob::kMaximumActiveOrders + 2),
+                     instrument, Side::Buy, level_price, one) ==
+                 OrderBookResult::Accepted);
+  require_invariants(checks, book);
+}
+
 }  // namespace
 
 int main() {
@@ -546,5 +692,7 @@ int main() {
   test_invalid_and_unknown_inputs(checks);
   test_query_values_are_copies(checks);
   test_clear_releases_all_logical_state(checks);
+  test_pool_identity_counters_and_reset(checks);
+  test_production_pool_capacity(checks);
   return checks.passed() ? 0 : 1;
 }
