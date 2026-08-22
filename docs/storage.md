@@ -1,109 +1,103 @@
-# Baseline Book Storage
+# Pool-backed Book Storage
 
 ## Scope and ownership
 
-`OrderBookStorage` owns the private active state for one instrument: active
-orders, the active order-ID lookup, bid and ask price indexes, price-level FIFO
-membership, and aggregate leaves quantities. It performs no crossing,
-matching, command sequencing, publication, lifecycle transition, networking,
-or concurrency work.
+`OrderBookStorage` is the private mutable storage boundary for one instrument.
+It owns all startup backing memory for resting orders, active-order lookup, bid
+levels, and ask levels. `MatchingEngine` remains the transaction and sequencing
+owner; public callers still receive copied `RestingOrderView` and `DepthEntry`
+values and never receive pool handles, slot indexes, generations, epochs, or
+mutable storage pointers.
 
-Milestone 5 does not change that boundary. `MatchingEngine`, not
-`OrderBookStorage`, owns the fixed-capacity execution and status outboxes. The
-engine reserves output only after immutable matching and final-state storage
-planning succeed, then invokes the existing narrow storage mutations. Storage
-neither sees reservations nor exposes nodes or iterators to publication code.
-An execution-outbox failure therefore occurs before any storage mutation; the
-separate automatic halt changes engine-owned instrument state while preserving
-all storage contents and FIFO priority.
+The production active-order capacity is the single neutral
+`kMaximumActiveOrders` constant, 131,072. Focused tests may configure smaller
+active-order and per-side level limits. Storage remains single-writer,
+non-copyable, and non-movable.
 
-Milestone 6 adds one narrow `clear()` operation for the local end-of-day
-transition. The matching engine preflights and reserves the required status
-record before invoking it. `clear()` removes all active-index entries, bid and
-ask levels, FIFO records, and aggregates without deciding lifecycle policy or
-publishing output. It retains container capacity where the standard baseline
-representation permits, and a subsequent session may reuse previously active
-order IDs.
+## Bounded representation
 
-The baseline is correctness-first. It uses standard-library containers:
+Construction performs every backing allocation:
 
-* an `std::unordered_map` indexes currently active orders by `OrderId`;
-* separate ordered `std::map` indexes keep bids descending and asks ascending;
-* each price level owns an `std::list` FIFO of private resting-order records.
+* `FixedObjectPool<OrderRecord>` owns order-node slots and its FIFO free-index
+  queue;
+* a power-of-two open-addressed active-ID table owns at least two buckets per
+  configured active order;
+* one sorted fixed-capacity `PriceLevel` array is allocated for bids and one for
+  asks;
+* the matching engine separately allocates both lossless outbox arrays.
 
-The active index stores private iterators into those FIFOs. Neither iterators,
-nodes, levels, nor container references leave the storage boundary. Copy and
-move are disabled so iterator ownership cannot migrate accidentally.
+An order node stores its public order fields plus private index/generation/epoch
+links to the previous and next node. A level stores aggregate leaves, count,
+and head/tail links. Bids are maintained in descending array order and asks in
+ascending order. Each level is FIFO from head to tail. Creating or removing a
+level may shift a bounded number of level records, but it never allocates or
+invalidates an order handle.
 
-This representation may allocate through standard containers. It is not the
-fixed-size object pool assigned to Milestones 9 and 10, and no performance
-claim is made for it.
+The active-ID table uses deterministic linear probing and backward-shift
+deletion. It has no node allocation, tombstones, global-heap fallback, or
+allocator cache. Public `OrderId` is only the lookup key and remains reusable
+as soon as its prior order ceases to be active; it is never a pool identity.
 
-Milestone 9 adds the standalone pool described by
-`docs/fixed-object-pool.md`, but deliberately does not change this
-representation. `OrderBookStorage` continues to own its existing `std::list`
-nodes and indexes until Milestone 10. No Phase 1 storage result, mutation,
-capacity preflight, or observable behavior changes in Milestone 9.
+## FIFO and release rules
 
-For Milestone 8, allocations and deallocations originating from these
-containers during public `MatchingEngine::process()` calls are permitted only
-as a measured Phase 1 diagnostic. They must be counted and disclosed, and the
-result must be labeled `phase1_allocating_storage`. Benchmark-owned trace,
-sample, checksum, statistics, and serialization storage must still be prepared
-outside the timed loop. Milestone 10 ends this exception: any allocation or
-deallocation anywhere in the timed command-processing path then invalidates
-the run.
+New resting orders append to the destination tail. Partial fills and
+same-price reductions retain both node identity and FIFO position. A
+same-price increase unlinks the same node and appends it to the tail. A price
+change removes and releases the old representation before the amended
+remainder is acquired and appended, so priority is lost. Cancellation, full
+fill, price-changing replacement, close/reset, and destruction return or
+destroy every affected node exactly once. Empty levels are removed.
 
-## Capacity and failure behavior
+The pool's deterministic FIFO free-index rule therefore determines reuse:
+initial acquisitions use ascending slot indexes, and released slots are reused
+in release order. Storage does not expose that identity through production
+APIs.
 
-Production limits are 131,072 active orders per book and 4,096 active price
-levels per side. Tests may configure smaller limits; requested limits are
-clamped to the production maxima.
+## Transaction preflight
 
-Insertion preflights domain values, duplicate active IDs, active-order
-capacity, new-level capacity, and aggregate overflow before logical mutation.
-Adding to an existing price level remains permitted when that side's level
-capacity is full, provided active-order and aggregate capacity remain.
-Ordinary rejection returns an explicit `OrderBookResult` and leaves logical
-state unchanged.
+Matching retains the `Validate -> Plan -> Reserve -> Execute -> Commit`
+lifecycle. Before logical mutation, preflight proves:
 
-Order-ID uniqueness is active-only under `docs/book-rules.md` v0.5. Removing an
-order erases it from the active index, so the same ID can be used by a later
-resting-order insertion. No historical-ID collection is retained.
+* the final active-order count fits;
+* the final destination-side level count fits;
+* destination aggregate arithmetic is representable;
+* engine and match sequence ranges fit;
+* the execution outbox can reserve the complete report batch;
+* when a remainder must rest, the pool's next free slot can advance its
+  generation.
 
-Aggregate overflow is a representational capacity failure and returns
-`CapacityExhausted`. The checked quantity helpers from Milestone 1 are used for
-both aggregate addition and subtraction.
+If the pool is currently full, preflight names the first immutable planned
+removal: an amended order is removed first, otherwise it is the first complete
+resting fill. The pool verifies that exact slot can be acquired after release.
+Consequently a full book is not falsely rejected when execution is guaranteed
+to make room before a remainder rests. With these resources proven and the
+outbox reserved, intrusive unlink/link operations, index changes, level shifts,
+pool release/acquire, report writes, and publication are infallible.
 
-## Immutable queries
+Capacity or generation failure uses the existing
+`OrderBookResult::CapacityExhausted`; pool-local statuses remain private. A
+failure before execution changes no book state, published report, match ID, or
+engine sequence. Existing command-sequence acceptance and fail-closed outbox
+rules are unchanged.
 
-Queries return counts, optionals, or copied vectors of `RestingOrderView` and
-`DepthEntry` values. Mutating those returned values cannot mutate storage.
-Depth means all active levels on one requested side, ordered best to worst,
-with price, aggregate leaves quantity, and active-order count.
+## Reset and diagnostics
 
-Matching uses `visit_orders_by_priority` to inspect copied, immutable order
-views without exposing storage nodes or iterators. The traversal follows each
-side's price index and each level's FIFO order. `reduce_resting_by` is the
-storage mutation used for a planned fill: it reduces leaves and the aggregate
-in place, or removes the order and empty level when the reduction exactly
-depletes leaves. It does not make crossing or amendment decisions.
+Close preflights pool epoch advancement before lifecycle mutation or status
+publication. Reset clears active-ID and level membership, destroys every live
+order through the pool, restores deterministic ascending initial allocation
+order, advances the epoch, and retains all backing allocations. Pool used/free
+counts become `0/capacity`; pool and level high-water values are retained.
+Pre-reset links are stale because their epoch no longer matches.
 
-Milestone 4 adds narrow quantity-update and FIFO-tail movement primitives.
-They maintain aggregates and private iterator ownership, but the matching
-engine decides whether an amendment retains priority, loses priority, or must
-use the shared matching plan. Repricing continues to use the existing removal
-and insertion primitives only after final-state planning succeeds.
+Constant-time diagnostics report configured capacity, pool used/free/high-water
+counts, bid/ask level high-water counts, order-node and pool-slot size/alignment,
+slot and free-index backing, active-index capacity/backing, level backing, and
+the total configured storage footprint.
 
-## Invariant scope
+## Debug invariants
 
-Debug builds perform a full structural scan through `validate_invariants()`.
-The scan checks index/FIFO bijection, order membership, instrument/side/price
-agreement, aggregate sums, non-empty levels, counts, capacities, side ordering,
-and best prices. Release builds retain the same callable test hook as a
-constant-time success so the full scan is absent from the Release path.
-
-Raw storage intentionally permits crossed bid and ask state for structural
-testing. The normative rule that a completed active matching book is not
-crossed becomes enforceable when Milestone 3 adds crossing and matching above
-this storage boundary.
+Debug validation checks the pool free structure and handle metadata, active-ID
+table structure, the active-index/FIFO/pool bijection, intrusive forward and
+back links, unique reachability, side/price ownership, aggregate quantities,
+counts and capacities, price ordering, and BBO consistency. No mutation path
+uses locks, atomics, exceptions, or heap allocation/deallocation.
