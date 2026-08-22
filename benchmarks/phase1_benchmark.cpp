@@ -49,6 +49,7 @@ enum class Phase : std::uint8_t {
   TimedProcess,
   TimedCollection,
   PostStatistics,
+  Destruction,
   Count,
 };
 
@@ -327,6 +328,7 @@ struct PhaseDeltas final {
   allocation_audit::Counters timed_process{};
   allocation_audit::Counters timed_collection{};
   allocation_audit::Counters post_statistics{};
+  allocation_audit::Counters destruction{};
 };
 
 struct RepetitionResult final {
@@ -350,6 +352,7 @@ struct RepetitionResult final {
   int starting_cpu{-1};
   int ending_cpu{-1};
   PhaseDeltas allocations{};
+  lob::StorageDiagnostics storage{};
 };
 
 struct AllocationKey final {
@@ -1085,6 +1088,10 @@ void checksum_result(std::uint64_t& checksum,
             return false;
           }
         }
+      }
+      {
+        allocation_audit::Guard phase(
+            allocation_audit::Phase::Destruction);
         engine.reset();
       }
       remaining -= count;
@@ -1109,6 +1116,8 @@ void checksum_result(std::uint64_t& checksum,
       allocation_audit::Phase::TimedProcess);
   const auto collection_before = allocation_audit::snapshot(
       allocation_audit::Phase::TimedCollection);
+  const auto destruction_before = allocation_audit::snapshot(
+      allocation_audit::Phase::Destruction);
   std::vector<std::uint64_t> samples;
   {
     allocation_audit::Guard phase(allocation_audit::Phase::Construction);
@@ -1216,8 +1225,10 @@ void checksum_result(std::uint64_t& checksum,
         ++result.lifecycle_transitions;
       }
     }
+    const auto diagnostics = engine->storage_diagnostics();
+    result.storage = diagnostics;
     {
-      allocation_audit::Guard phase(allocation_audit::Phase::Construction);
+      allocation_audit::Guard phase(allocation_audit::Phase::Destruction);
       engine.reset();
     }
   }
@@ -1260,6 +1271,9 @@ void checksum_result(std::uint64_t& checksum,
   result.allocations.post_statistics =
       allocation_audit::snapshot(allocation_audit::Phase::PostStatistics) -
       statistics_before;
+  result.allocations.destruction =
+      allocation_audit::snapshot(allocation_audit::Phase::Destruction) -
+      destruction_before;
   if (result.minimum_active == std::numeric_limits<std::size_t>::max()) {
     result.minimum_active = 0;
   }
@@ -1455,7 +1469,7 @@ void write_distribution_json(
   if (!output) {
     return false;
   }
-  output << "LOB_PHASE1_ALLOCATION_V2 " << options.mode << ' '
+  output << "LOB_PHASE2_POOL_ALLOCATION_V3 " << options.mode << ' '
          << options.repetitions << ' ' << options.warmup << ' '
          << options.samples_override << ' ' << options.workload << '\n';
   for (const auto& run : runs) {
@@ -1472,7 +1486,7 @@ void write_distribution_json(
       for (const auto* counters :
            {&phases.construction, &phases.initial_population, &phases.warmup,
             &phases.timed_process, &phases.timed_collection,
-            &phases.post_statistics}) {
+            &phases.post_statistics, &phases.destruction}) {
         output << ' ' << counters->allocations << ' '
                << counters->allocated_bytes << ' '
                << counters->deallocations;
@@ -1496,7 +1510,7 @@ void write_distribution_json(
   std::string workload;
   if (!(input >> schema >> mode >> repetitions >> warmup >> samples_override >>
         workload) ||
-      schema != "LOB_PHASE1_ALLOCATION_V2" || mode != options.mode ||
+      schema != "LOB_PHASE2_POOL_ALLOCATION_V3" || mode != options.mode ||
       repetitions != options.repetitions || warmup != options.warmup ||
       samples_override != options.samples_override ||
       workload != options.workload) {
@@ -1528,7 +1542,7 @@ void write_distribution_json(
          {&record.phases.construction, &record.phases.initial_population,
           &record.phases.warmup, &record.phases.timed_process,
           &record.phases.timed_collection,
-          &record.phases.post_statistics}) {
+          &record.phases.post_statistics, &record.phases.destruction}) {
       input >> counters->allocations >> counters->allocated_bytes >>
           counters->deallocations;
     }
@@ -1561,6 +1575,7 @@ void write_distribution_json(
   constexpr bool git_dirty = LOB_BENCHMARK_GIT_DIRTY;
   const bool allocation_audit_attached = !options.allocation_input.empty();
   allocation_audit::Counters benchmark_owned_timed_activity;
+  allocation_audit::Counters process_timed_activity;
   bool run_validity_passed = true;
   bool allocation_policy_compliant = true;
   bool performance_gate_compliant = true;
@@ -1571,6 +1586,12 @@ void write_distribution_json(
     performance_gate_compliant =
         performance_gate_compliant && run.performance_gate_compliant;
     for (const auto& repetition : run.repetitions) {
+      process_timed_activity.allocations +=
+          repetition.allocations.timed_process.allocations;
+      process_timed_activity.allocated_bytes +=
+          repetition.allocations.timed_process.allocated_bytes;
+      process_timed_activity.deallocations +=
+          repetition.allocations.timed_process.deallocations;
       benchmark_owned_timed_activity.allocations +=
           repetition.allocations.timed_collection.allocations;
       benchmark_owned_timed_activity.allocated_bytes +=
@@ -1583,17 +1604,38 @@ void write_distribution_json(
       benchmark_owned_timed_activity.allocations == 0 &&
       benchmark_owned_timed_activity.allocated_bytes == 0 &&
       benchmark_owned_timed_activity.deallocations == 0;
-  const bool canonical_baseline_accepted =
-      accepted && options.mode == "acceptance";
+  const bool canonical_run_accepted = accepted && options.mode == "acceptance";
+  const lob::StorageDiagnostics storage =
+      runs.empty() || runs.front().repetitions.empty()
+          ? lob::StorageDiagnostics{}
+          : runs.front().repetitions.front().storage;
+  allocation_audit::Counters construction_total;
+  allocation_audit::Counters destruction_total;
+  for (const auto& run : runs) {
+    for (const auto& repetition : run.repetitions) {
+      construction_total.allocations +=
+          repetition.allocations.construction.allocations;
+      construction_total.allocated_bytes +=
+          repetition.allocations.construction.allocated_bytes;
+      construction_total.deallocations +=
+          repetition.allocations.construction.deallocations;
+      destruction_total.allocations +=
+          repetition.allocations.destruction.allocations;
+      destruction_total.allocated_bytes +=
+          repetition.allocations.destruction.allocated_bytes;
+      destruction_total.deallocations +=
+          repetition.allocations.destruction.deallocations;
+    }
+  }
   output << std::fixed << std::setprecision(3)
-         << "{\n  \"schema\": \"lob.phase1.performance.v1\",\n"
-         << "  \"baseline_profile\": \"phase1_allocating_storage\",\n"
+         << "{\n  \"schema\": \"lob.phase2.pool.performance.v1\",\n"
+         << "  \"baseline_profile\": \"phase2_pool_backed_storage\",\n"
          << "  \"primary_boundary\": \"public_process_completion\",\n"
          << "  \"matching_core_measured\": false,\n"
-         << "  \"allocation_policy\": \"phase1_storage_diagnostic\",\n"
+         << "  \"allocation_policy\": \"strict_total_zero\",\n"
          << "  \"allocation_audit_attached\": "
          << (allocation_audit_attached ? "true" : "false") << ",\n"
-         << "  \"strict_zero_allocation_applicable\": false,\n"
+         << "  \"strict_zero_allocation_applicable\": true,\n"
          << "  \"strict_zero_allocation_enforcement_milestone\": 10,\n"
          << "  \"git_commit\": \"" << LOB_BENCHMARK_GIT_COMMIT << "\",\n"
          << "  \"git_dirty\": " << (git_dirty ? "true" : "false")
@@ -1621,8 +1663,34 @@ void write_distribution_json(
          << "  \"public_process_completion_gate\":{"
             "\"p50_ns\":1500,\"p99_ns\":5000,\"p999_ns\":15000,"
             "\"throughput_per_second\":500000},\n"
-         << "  \"accepted_canonical_baseline\": "
-         << (canonical_baseline_accepted ? "true" : "false") << ",\n"
+         << "  \"accepted_canonical_run\": "
+         << (canonical_run_accepted ? "true" : "false") << ",\n"
+         << "  \"storage_memory\":{\"active_order_capacity\":"
+         << storage.configured_active_order_capacity
+         << ",\"order_node_size\":" << storage.order_node_size
+         << ",\"order_node_alignment\":" << storage.order_node_alignment
+         << ",\"pool_slot_size\":" << storage.pool_slot_size
+         << ",\"pool_slot_alignment\":" << storage.pool_slot_alignment
+         << ",\"pool_slot_backing_bytes\":"
+         << storage.pool_slot_backing_bytes
+         << ",\"free_index_backing_bytes\":"
+         << storage.free_index_backing_bytes
+         << ",\"pool_backing_bytes\":" << storage.pool_backing_bytes
+         << ",\"active_index_capacity\":" << storage.active_index_capacity
+         << ",\"active_index_backing_bytes\":"
+         << storage.active_index_backing_bytes
+         << ",\"price_level_backing_bytes\":"
+         << storage.price_level_backing_bytes
+         << ",\"total_configured_storage_bytes\":"
+         << storage.total_configured_storage_bytes << "},\n"
+         << "  \"construction_allocation_totals\":{\"allocations\":"
+         << construction_total.allocations << ",\"allocated_bytes\":"
+         << construction_total.allocated_bytes << ",\"deallocations\":"
+         << construction_total.deallocations << "},\n"
+         << "  \"destruction_allocation_totals\":{\"allocations\":"
+         << destruction_total.allocations << ",\"allocated_bytes\":"
+         << destruction_total.allocated_bytes << ",\"deallocations\":"
+         << destruction_total.deallocations << "},\n"
          << "  \"environment\": {\"cpu_model\":\""
          << json_escape(environment.cpu_model) << "\",\"microcode\":\""
          << json_escape(environment.microcode) << "\",\"kernel\":\""
@@ -1707,6 +1775,20 @@ void write_distribution_json(
            << ",\"performance_gate_compliant\":"
            << (run.performance_gate_compliant ? "true" : "false")
            << ",\"public_gate_passes\":" << run.public_gate_passes
+           << ",\"pool_high_water_count\":"
+           << (run.repetitions.empty()
+                   ? 0
+                   : run.repetitions.front().storage.pool_high_water_count)
+           << ",\"bid_level_high_water_count\":"
+           << (run.repetitions.empty()
+                   ? 0
+                   : run.repetitions.front().storage
+                         .bid_level_high_water_count)
+           << ",\"ask_level_high_water_count\":"
+           << (run.repetitions.empty()
+                   ? 0
+                   : run.repetitions.front().storage
+                         .ask_level_high_water_count)
            << ",\"median\":" << lob::benchmark::statistics_json(run.median)
            << ",\"repetition_results\":[";
     for (std::size_t repetition = 0; repetition < run.repetitions.size();
@@ -1754,6 +1836,8 @@ void write_distribution_json(
       write_counters_json(output, value.allocations.warmup);
       output << ",\"post_statistics\":";
       write_counters_json(output, value.allocations.post_statistics);
+      output << ",\"destruction\":";
+      write_counters_json(output, value.allocations.destruction);
       output << "}}";
       if (repetition + 1 != run.repetitions.size()) {
         output << ',';
@@ -1765,11 +1849,17 @@ void write_distribution_json(
     }
     output << '\n';
   }
-  output << "  ],\n  \"known_phase1_storage_allocation_sites\": ["
-            "\"std::map::try_emplace price-level nodes\","
-            "\"std::list::push_back FIFO order nodes\","
-            "\"std::unordered_map::emplace active-ID nodes\","
-            "\"container erase and level removal deallocations\"],\n"
+  output << "  ],\n  \"allocation_site_reconciliation\": ["
+            "\"FIFO orders use startup-backed FixedObjectPool slots and intrusive links\","
+            "\"active IDs use a startup-backed open-addressed table with backward-shift deletion\","
+            "\"bid and ask levels use startup-backed sorted arrays\","
+            "\"erase, fill, cancel, reprice, and reset return bounded storage without heap deallocation\"],\n"
+         << "  \"timed_process_allocation_count\": "
+         << process_timed_activity.allocations << ",\n"
+         << "  \"timed_process_allocated_bytes\": "
+         << process_timed_activity.allocated_bytes << ",\n"
+         << "  \"timed_process_deallocation_count\": "
+         << process_timed_activity.deallocations << ",\n"
          << "  \"timed_benchmark_owned_allocation_count\": "
          << benchmark_owned_timed_activity.allocations << ",\n"
          << "  \"timed_benchmark_owned_allocated_bytes\": "
@@ -1804,11 +1894,33 @@ void write_distribution_json(
   if (!output) {
     return false;
   }
-  output << "# Phase 1 Performance Baseline\n\n"
-         << "Profile: `phase1_allocating_storage`\n\n"
+  const lob::StorageDiagnostics storage =
+      runs.empty() || runs.front().repetitions.empty()
+          ? lob::StorageDiagnostics{}
+          : runs.front().repetitions.front().storage;
+  allocation_audit::Counters construction_total;
+  allocation_audit::Counters destruction_total;
+  for (const auto& run : runs) {
+    for (const auto& repetition : run.repetitions) {
+      construction_total.allocations +=
+          repetition.allocations.construction.allocations;
+      construction_total.allocated_bytes +=
+          repetition.allocations.construction.allocated_bytes;
+      construction_total.deallocations +=
+          repetition.allocations.construction.deallocations;
+      destruction_total.allocations +=
+          repetition.allocations.destruction.allocations;
+      destruction_total.allocated_bytes +=
+          repetition.allocations.destruction.allocated_bytes;
+      destruction_total.deallocations +=
+          repetition.allocations.destruction.deallocations;
+    }
+  }
+  output << "# Phase 2 Pool-backed Storage Baseline\n\n"
+         << "Profile: `phase2_pool_backed_storage`\n\n"
          << "Boundary: public `MatchingEngine::process()` entry through "
             "return\n\n"
-         << "Accepted canonical baseline: "
+         << "Accepted canonical run: "
          << (accepted && options.mode == "acceptance" ? "yes" : "no")
          << "\n\n"
          << "The matching-core endpoint was not independently measured. "
@@ -1850,6 +1962,34 @@ void write_distribution_json(
          << " ns; overhead was not subtracted.\n"
          << "- Mode: " << options.mode << ", repetitions: "
          << options.repetitions << "\n\n"
+         << "## Configured storage\n\n"
+         << "- Active-order capacity: "
+         << storage.configured_active_order_capacity << "\n"
+         << "- Order node: " << storage.order_node_size << " bytes, alignment "
+         << storage.order_node_alignment << " bytes\n"
+         << "- Pool slot: " << storage.pool_slot_size << " bytes, alignment "
+         << storage.pool_slot_alignment << " bytes\n"
+         << "- Pool backing (slots plus free indexes): "
+         << storage.pool_backing_bytes << " bytes\n"
+         << "  - Slot backing: " << storage.pool_slot_backing_bytes
+         << " bytes\n"
+         << "  - Free-index backing: " << storage.free_index_backing_bytes
+         << " bytes\n"
+         << "- Active-ID table: " << storage.active_index_capacity
+         << " buckets, " << storage.active_index_backing_bytes << " bytes\n"
+         << "- Bid/ask price-level arrays: "
+         << storage.price_level_backing_bytes << " bytes\n"
+         << "- Total configured storage backing: "
+         << storage.total_configured_storage_bytes << " bytes\n\n"
+         << "Canonical audit construction totals (engine, storage, outboxes, "
+            "and pre-sized sample buffers): `"
+         << construction_total.allocations << '/'
+         << construction_total.allocated_bytes << '/'
+         << construction_total.deallocations
+         << "` allocations/bytes/deallocations. Destruction totals: `"
+         << destruction_total.allocations << '/'
+         << destruction_total.allocated_bytes << '/'
+         << destruction_total.deallocations << "`.\n\n"
          << "## Results\n\n"
          << "| Workload | Seed | Samples | p50 ns | p90 ns | p99 ns | p99.9 ns | "
             "p99.99 ns | Max ns | Throughput/s | Gate |\n"
@@ -1867,6 +2007,18 @@ void write_distribution_json(
                    ? (run.performance_gate_compliant ? "pass" : "fail")
                    : "informational")
            << " |\n";
+  }
+  output << "\n### Storage high-water evidence\n\n"
+         << "| Workload | Seed | Pool | Bid levels | Ask levels |\n"
+         << "| --- | ---: | ---: | ---: | ---: |\n";
+  for (const auto& run : runs) {
+    const auto high_water = run.repetitions.empty()
+                                ? lob::StorageDiagnostics{}
+                                : run.repetitions.front().storage;
+    output << "| " << run.workload << " | " << run.seed << " | "
+           << high_water.pool_high_water_count << " | "
+           << high_water.bid_level_high_water_count << " | "
+           << high_water.ask_level_high_water_count << " |\n";
   }
   output << "\n### Per-repetition evidence\n\n"
          << "| Workload | Seed | Rep | p50 | p90 | p99 | p99.9 | p99.99 | "
@@ -1907,12 +2059,11 @@ void write_distribution_json(
             "informational conservative evidence only.\n\n"
          << "## Allocation classification\n\n"
          << "Global allocation overrides were enabled only in the separate "
-            "audit executable. Timed `process()` totals include permitted "
-            "Phase 1 storage activity. Timed sample/checksum collection "
-            "reported zero allocation. Exact dynamic attribution inside the "
-            "engine was not attempted; source-audited sites are map level "
-            "nodes, list FIFO nodes, and unordered-map active-ID nodes. Strict "
-            "total zero allocation remains a Milestone 10 validity rule.\n\n"
+            "audit executable. Strict validity requires both timed public "
+            "`process()` and timed sample/checksum collection to report zero "
+            "allocations, allocated bytes, and deallocations in every "
+            "repetition. Order FIFOs, active IDs, and price levels are all "
+            "startup-backed bounded storage.\n\n"
          << "| Workload | Seed | Repetition | Timed process allocs/bytes/frees | "
             "Timed collection allocs/bytes/frees |\n"
          << "| --- | ---: | ---: | ---: | ---: |\n";
@@ -1938,7 +2089,7 @@ void write_distribution_json(
          << "## Reproduction\n\n"
          << "```bash\ncmake --preset release\n"
          << "cmake --build --preset release --target benchmarks\n"
-         << "./build/release/benchmarks/lob_phase1_allocation_audit --mode "
+         << "./build/release/benchmarks/lob_phase2_pool_allocation_audit --mode "
          << options.mode << " --workload " << options.workload
          << " --seeds ";
   for (std::size_t index = 0; index < options.seeds.size(); ++index) {
@@ -1956,7 +2107,7 @@ void write_distribution_json(
     output << " --cpu " << options.cpu;
   }
   output << " --allocation-output <path>\n"
-         << "./build/release/benchmarks/lob_phase1_benchmark --mode "
+         << "./build/release/benchmarks/lob_phase2_pool_benchmark --mode "
          << options.mode << " --workload " << options.workload
          << " --seeds ";
   for (std::size_t index = 0; index < options.seeds.size(); ++index) {
@@ -1984,7 +2135,7 @@ void write_distribution_json(
 int main(int argc, char** argv) {
   const auto parsed = parse_options(argc, argv);
   if (!parsed) {
-    std::cerr << "usage: phase1 benchmark --mode smoke|acceptance "
+    std::cerr << "usage: phase2 pool benchmark --mode smoke|acceptance "
                  "[--workload all|NAME] [--seeds N[,N]] [--samples N] "
                  "[--warmup N] [--repetitions N] [--cpu N] [--json PATH] "
                  "[--sibling-occupancy LABEL] "
@@ -2101,6 +2252,9 @@ int main(int argc, char** argv) {
         }
         run.allocation_policy_compliant =
             run.allocation_policy_compliant &&
+            repetition.allocations.timed_process.allocations == 0 &&
+            repetition.allocations.timed_process.allocated_bytes == 0 &&
+            repetition.allocations.timed_process.deallocations == 0 &&
             repetition.allocations.timed_collection.allocations == 0 &&
             repetition.allocations.timed_collection.allocated_bytes == 0 &&
             repetition.allocations.timed_collection.deallocations == 0;
