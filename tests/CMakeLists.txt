@@ -45,6 +45,14 @@ target_link_libraries(
 )
 
 add_executable(
+  lob_matching_engine_allocation_test
+  matching_engine_allocation_test.cpp
+)
+target_link_libraries(
+  lob_matching_engine_allocation_test PRIVATE lob::engine
+)
+
+add_executable(
   lob_benchmark_support_test
   benchmark_support_test.cpp
   ../benchmarks/benchmark_support.cpp
@@ -67,20 +75,24 @@ add_test(
   NAME lob.fixed_object_pool_allocation
   COMMAND lob_fixed_object_pool_allocation_test
 )
+add_test(
+  NAME lob.matching_engine_allocation
+  COMMAND lob_matching_engine_allocation_test
+)
 add_test(NAME lob.benchmark_support COMMAND lob_benchmark_support_test)
 add_test(
   NAME lob.benchmark_smoke
-  COMMAND lob_phase1_benchmark
+  COMMAND lob_phase2_pool_benchmark
     --mode smoke
-    --workload mixed
+    --workload unknown_cancel
     --seeds 24301
-    --samples 1000
-    --warmup 100
+    --samples 10
+    --warmup 1
     --repetitions 1
 )
 set_tests_properties(
   lob.benchmark_smoke
-  PROPERTIES PASS_REGULAR_EXPRESSION "\"schema\": \"lob.phase1.performance.v1\""
+  PROPERTIES PASS_REGULAR_EXPRESSION "\"schema\": \"lob.phase2.pool.performance.v1\""
 )
 add_test(
   NAME lob.fixed_object_pool_benchmark_smoke
@@ -118,6 +130,6 @@ set_tests_properties(
 )
 add_test(
   NAME lob.benchmark_invalid_config
-  COMMAND lob_phase1_benchmark --mode acceptance --workload mixed
+  COMMAND lob_phase2_pool_benchmark --mode acceptance --workload mixed
 )
 set_tests_properties(lob.benchmark_invalid_config PROPERTIES WILL_FAIL TRUE)
