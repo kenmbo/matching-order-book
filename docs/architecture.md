@@ -152,26 +152,20 @@ only destructive local transition and empties the book. Open begins a new
 empty session without resetting sequence, match-ID, diagnostic, or committed
 outbox state.
 
-`OrderBookStorage` is private to the matching engine.  The initial baseline
-uses an order-ID lookup, price-level indexes, and FIFO queues; Phase 2 may
-replace per-order allocation with a fixed-size object pool without changing
-the public behavior or component boundary.
+`OrderBookStorage` is private to the matching engine. Milestone 10 retains its
+public behavior and component boundary while making storage own the Milestone
+9 fixed-object pool, a bounded active-ID table, and bounded ordered price-level
+arrays. Pooled order nodes carry private intrusive FIFO links. The complete
+backing memory is allocated at startup, and owner/index/generation/epoch
+identity never escapes the storage boundary. The pool contract remains in
+`docs/fixed-object-pool.md`; integrated representation and preflight are in
+`docs/storage.md`.
 
-Milestone 9 provides that fixed-object pool only as a standalone component.
-It owns one aligned slot array and one free-index array allocated completely at
-startup, uses owner/index/generation/epoch handles, and remains absent from
-both `OrderBookStorage` and `MatchingEngine`. Milestone 10 is the first
-milestone permitted to make storage own the pool or include node reservation
-in matching transaction preflight. The standalone contract is recorded in
-`docs/fixed-object-pool.md`.
-
-The Phase 1 storage representation is intentionally allocating. Its bounded
-logical capacities do not imply that standard-container nodes were
-preallocated. Milestone 8 measures and discloses those timed allocations as a
-diagnostic while requiring the benchmark harness itself to remain
-allocation-free inside the timed loop. Milestone 10 replaces this exception
-with strict zero allocation and deallocation for the complete timed
-command-processing path and records a separate before/after baseline.
+The retained Phase 1 representation used allocating standard-container nodes.
+Milestone 8 measures those timed allocations as a separately named diagnostic
+baseline. The Milestone 10 pool-backed profile enforces strict zero allocation
+and deallocation across the complete timed command-processing path and records
+a separate before/after artifact rather than replacing the Phase 1 evidence.
 
 Milestone 3 implements the `Plan` and `Execute` sides of this lifecycle for
 `NewOrder`.  Its internal fixed-size plan records at most 256 resting order
@@ -338,13 +332,22 @@ requires a later write-ahead log or equivalent durable store.
 
 ## 10. Threading and memory model
 
-### 10.1 Phase 1
+### 10.1 Local engine through Phase 2
 
 * One thread invokes the local matching engine.
 * The engine is the sole reader and writer of its local book state.
 * Tests call the public API directly; they require no socket, dispatcher, or
   scheduler. The matching engine's owned outboxes are passive in-memory
   storage, not inter-thread queues.
+* `OrderBookStorage` owns a fixed-object pool, a bounded open-addressed active
+  ID index, and sorted bounded bid/ask level arrays. Order nodes use private
+  generation-tagged intrusive FIFO links.
+* All storage and outbox backing is allocated during construction. The full
+  steady-state public `process()` path performs no heap allocation or
+  deallocation.
+* Transaction preflight accounts for final active/level counts and the exact
+  first planned node release when a full pool must make room for a remainder.
+  Reset preflights pool epoch advancement before lifecycle publication.
 
 ### 10.2 Phase 3 target
 
