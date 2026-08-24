@@ -110,6 +110,27 @@ The full-capacity and repeated-reuse cases run in Debug, ASan, and UBSan. The
 Release benchmark smoke is deterministic and separate from sanitizer timing;
 the canonical component measurement uses the Release preset only.
 
+## Integrated pool-backed storage validation
+
+Milestone 10 retains the standalone pool suite and adds storage-internal
+identity tests for partial-fill and same-price-amend retention, FIFO requeue,
+release/reuse generation changes, reset epoch invalidation, exact counters,
+retained high water, and the production 131,072-order boundary. Matching tests
+cover ordinary and full-capacity repricing, full-pool fills that make room for
+a remainder, capacity rejection without mutation, 256 fills, outbox aborts,
+halted cancellation, and close/open reset behavior. The Phase 1 reference
+model remains independent and compares complete results, reports, sequences,
+IDs, lifecycle state, depth, aggregates, and FIFO order.
+
+`lob_matching_engine_allocation_test` interposes the global heap and snapshots
+around individual public `process()` calls. Adds, cancels, partial and complete
+fills, same-price and price-changing amendments, level creation/removal,
+full-pool reuse, 256 fills, and close/reset must each report exactly zero
+allocations, allocated bytes, and deallocations. Startup is deliberately
+outside those snapshots. The canonical Release allocation audit repeats every
+Milestone 8 workload and repetition and applies the same strict rule to both
+timed `process()` and timed benchmark-owned collection phases.
+
 ## Test layers
 
 Tests are organized by the narrowest useful scope:
