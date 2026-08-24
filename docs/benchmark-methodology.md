@@ -78,6 +78,16 @@ cmake --preset release
 cmake --build --preset release --target benchmarks
 ```
 
+For Milestone 10, the allocation audit additionally separates destruction and
+enforces `0/0/0` allocations/bytes/deallocations for every timed public
+`process()` phase and timed collection phase in every workload and repetition.
+The former `std::list` nodes are pool slots, the former `std::unordered_map`
+nodes are a startup-backed open-addressed table, and the former `std::map`
+nodes are startup-backed sorted level arrays. Construction totals may include
+the engine object, storage arrays, pool metadata, both outboxes, and benchmark
+sample storage; configured component footprints are reported independently so
+these permitted startup costs are not confused with steady state.
+
 For the Milestone 9 pool baseline, the pool is constructed and warmed before
 measurement. Full-capacity cycles and a deterministic half-full churn trace
 use preallocated handle, operation, and sample arrays. A separate allocation
@@ -195,3 +205,12 @@ Milestone 8. Starting with Milestone 10, any timed allocation or deallocation
 invalidates the run. Store machine-readable results with a human-readable
 baseline report, and never overwrite the Phase 1 allocating baseline with the
 strict-zero Milestone 10 baseline.
+
+The Milestone 10 `phase2_pool_backed_storage` run reproduces the exact
+Milestone 8 traces, seeds, warm-up, repetitions, sample counts, affinity policy,
+percentile convention, and public timing boundary. Trace checksums must match
+`phase1_allocating_storage_2026-08-17`. A postprocessor records absolute and
+percentage before/after differences and applies the existing median relative
+rules (p99 at most 10% regression, p99.9 at most 15%, throughput at most 10%)
+in addition to the absolute public gate. Milestone 9 component latency remains
+separate evidence and is never compared directly with public process latency.
