@@ -9,6 +9,58 @@
 
 namespace lob::benchmark {
 
+bool distinct_seeds(std::span<const std::uint64_t> seeds) noexcept {
+  for (std::size_t left = 0; left < seeds.size(); ++left) {
+    for (std::size_t right = left + 1; right < seeds.size(); ++right) {
+      if (seeds[left] == seeds[right]) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool canonical_acceptance_configuration(
+    const ExperimentConfiguration& configuration) noexcept {
+  return configuration.mode == "acceptance" &&
+         configuration.workload == "all" &&
+         configuration.seeds.size() == kCanonicalSeeds.size() &&
+         std::equal(configuration.seeds.begin(), configuration.seeds.end(),
+                    kCanonicalSeeds.begin()) &&
+         distinct_seeds(configuration.seeds) &&
+         configuration.samples_override == 0 &&
+         configuration.warmup == kCanonicalWarmup &&
+         configuration.repetitions == kCanonicalRepetitions &&
+         configuration.cpu >= 0;
+}
+
+std::size_t canonical_sample_count(std::string_view workload) noexcept {
+  if (workload == "mixed" || workload == "unknown_cancel" ||
+      workload == "noop" || workload == "unknown_amend") {
+    return 1'000'000;
+  }
+  if (workload == "cancel" || workload == "reduce" ||
+      workload == "increase" || workload == "noncross_add") {
+    return 500'000;
+  }
+  if (workload == "fill1") {
+    return 200'000;
+  }
+  if (workload == "fill4") {
+    return 50'000;
+  }
+  if (workload == "fill16" || workload == "multi_level") {
+    return 20'000;
+  }
+  if (workload == "fill64") {
+    return 5'000;
+  }
+  if (workload == "fill256") {
+    return 1'000;
+  }
+  return 0;
+}
+
 std::uint64_t MixedCounts::total() const noexcept {
   return cancel + reduce + increase + no_op_amend + non_crossing_add + cross;
 }

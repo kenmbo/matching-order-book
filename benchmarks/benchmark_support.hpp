@@ -1,11 +1,34 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace lob::benchmark {
+
+inline constexpr std::array<std::string_view, 14> kCanonicalWorkloads{
+    "mixed",          "cancel",   "unknown_cancel", "reduce",
+    "increase",       "noop",     "unknown_amend",  "noncross_add",
+    "fill1",          "fill4",    "fill16",         "fill64",
+    "fill256",        "multi_level"};
+inline constexpr std::array<std::uint64_t, 2> kCanonicalSeeds{0x5eed,
+                                                              0xc0ffee};
+inline constexpr std::size_t kCanonicalWarmup = 10'000;
+inline constexpr std::size_t kCanonicalRepetitions = 5;
+
+struct ExperimentConfiguration final {
+  std::string_view mode{};
+  std::string_view workload{};
+  std::span<const std::uint64_t> seeds{};
+  std::size_t samples_override{};
+  std::size_t warmup{};
+  std::size_t repetitions{};
+  int cpu{-1};
+};
 
 enum class MixedOperation : std::uint8_t {
   Cancel,
@@ -75,5 +98,11 @@ struct GateEvaluation final {
                                          std::uint64_t value) noexcept;
 [[nodiscard]] std::string statistics_json(
     const LatencyStatistics& statistics);
+[[nodiscard]] bool distinct_seeds(
+    std::span<const std::uint64_t> seeds) noexcept;
+[[nodiscard]] bool canonical_acceptance_configuration(
+    const ExperimentConfiguration& configuration) noexcept;
+[[nodiscard]] std::size_t canonical_sample_count(
+    std::string_view workload) noexcept;
 
 }  // namespace lob::benchmark
