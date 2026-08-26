@@ -366,6 +366,25 @@ class ComparatorTests(unittest.TestCase):
             self.assertEqual(output_path.read_bytes(), first_output)
             self.assertEqual(report_path.read_bytes(), first_report)
             self.assertEqual(candidate_path.read_bytes(), original)
+            in_place = subprocess.run(
+                (
+                    sys.executable,
+                    str(COMPARATOR_PATH),
+                    "--baseline",
+                    str(baseline_path),
+                    "--candidate",
+                    str(candidate_path),
+                    "--output-json",
+                    str(candidate_path),
+                    "--report",
+                    str(report_path),
+                ),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertNotEqual(in_place.returncode, 0)
+            self.assertEqual(candidate_path.read_bytes(), original)
 
 
 if __name__ == "__main__":
