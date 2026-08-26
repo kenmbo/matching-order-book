@@ -1,4 +1,5 @@
 #include "benchmark_support.hpp"
+#include "benchmark_provenance.hpp"
 
 #include "lob/matching/matching_engine.hpp"
 
@@ -29,14 +30,6 @@
 #include <unistd.h>
 #include <utility>
 #include <vector>
-
-#ifndef LOB_BENCHMARK_GIT_COMMIT
-#define LOB_BENCHMARK_GIT_COMMIT "unknown"
-#endif
-
-#ifndef LOB_BENCHMARK_GIT_DIRTY
-#define LOB_BENCHMARK_GIT_DIRTY "unknown"
-#endif
 
 namespace allocation_audit {
 
@@ -318,6 +311,7 @@ struct Options final {
   std::string report_path{};
   std::string allocation_input{};
   std::string allocation_output{};
+  std::string provenance_path{};
 };
 
 struct PhaseDeltas final {
@@ -390,6 +384,10 @@ struct Environment final {
   std::string sibling_occupancy{};
   std::string governor{};
   std::string frequency_khz{};
+  std::string scaling_driver{};
+  std::string scaling_min_khz{};
+  std::string scaling_max_khz{};
+  std::string energy_performance_preference{};
   std::string numa_node{};
   std::uint64_t clock_resolution_ns{};
   lob::benchmark::LatencyStatistics clock_overhead{};
@@ -454,6 +452,7 @@ template <typename Domain, typename Source>
 
 [[nodiscard]] bool parse_seeds(std::string_view value,
                                std::vector<std::uint64_t>& seeds) {
+  std::vector<std::uint64_t> parsed_seeds;
   std::size_t start = 0;
   while (start < value.size()) {
     const auto comma = value.find(',', start);
@@ -464,22 +463,30 @@ template <typename Domain, typename Source>
     if (!seed) {
       return false;
     }
-    seeds.push_back(*seed);
+    parsed_seeds.push_back(*seed);
     if (comma == std::string_view::npos) {
       break;
     }
     start = comma + 1;
   }
-  return !seeds.empty();
+  if (parsed_seeds.empty() || !lob::benchmark::distinct_seeds(parsed_seeds)) {
+    return false;
+  }
+  seeds = std::move(parsed_seeds);
+  return true;
 }
 
 [[nodiscard]] std::optional<Options> parse_options(int argc, char** argv) {
   Options options;
+  std::vector<std::string_view> seen_arguments;
   for (int index = 1; index < argc; ++index) {
     const std::string_view argument{argv[index]};
-    if (index + 1 >= argc) {
+    if (index + 1 >= argc ||
+        std::find(seen_arguments.begin(), seen_arguments.end(), argument) !=
+            seen_arguments.end()) {
       return std::nullopt;
     }
+    seen_arguments.push_back(argument);
     const std::string_view value{argv[++index]};
     if (argument == "--mode") {
       options.mode = value;
@@ -499,7 +506,8 @@ template <typename Domain, typename Source>
       options.samples_override = static_cast<std::size_t>(*parsed);
     } else if (argument == "--warmup") {
       const auto parsed = parse_unsigned(value);
-      if (!parsed || *parsed > std::numeric_limits<std::size_t>::max()) {
+      if (!parsed || *parsed == 0 ||
+          *parsed > std::numeric_limits<std::size_t>::max()) {
         return std::nullopt;
       }
       options.warmup = static_cast<std::size_t>(*parsed);
@@ -526,28 +534,41 @@ template <typename Domain, typename Source>
       options.allocation_input = value;
     } else if (argument == "--allocation-output") {
       options.allocation_output = value;
+    } else if (argument == "--provenance") {
+      options.provenance_path = value;
     } else {
       return std::nullopt;
     }
   }
 
-  if (options.mode != "smoke" && options.mode != "acceptance") {
+  if (options.mode != "smoke" && options.mode != "exploratory" &&
+      options.mode != "acceptance") {
     return std::nullopt;
   }
   if (options.seeds.empty()) {
-    options.seeds = options.mode == "acceptance"
-                        ? std::vector<std::uint64_t>{0x5eed, 0xc0ffee}
-                        : std::vector<std::uint64_t>{0x5eed};
+    options.seeds = options.mode == "smoke"
+                        ? std::vector<std::uint64_t>{0x5eed}
+                        : std::vector<std::uint64_t>{
+                              lob::benchmark::kCanonicalSeeds.begin(),
+                              lob::benchmark::kCanonicalSeeds.end()};
   }
   if (options.repetitions == 0) {
-    options.repetitions = options.mode == "acceptance" ? 5 : 1;
+    options.repetitions = options.mode == "smoke"
+                              ? 1
+                              : lob::benchmark::kCanonicalRepetitions;
   }
   if (options.warmup == 0) {
-    options.warmup = options.mode == "acceptance" ? 10'000 : 100;
+    options.warmup = options.mode == "smoke"
+                         ? 100
+                         : lob::benchmark::kCanonicalWarmup;
   }
+  const lob::benchmark::ExperimentConfiguration configuration{
+      options.mode,          options.workload, options.seeds,
+      options.samples_override, options.warmup,   options.repetitions,
+      options.cpu};
   if (options.mode == "acceptance" &&
-      (options.repetitions < 5 || options.seeds.size() < 2 ||
-       options.cpu < 0 || options.workload != "all")) {
+      (!lob::benchmark::canonical_acceptance_configuration(configuration) ||
+       options.sibling_occupancy == "not_observed")) {
     return std::nullopt;
   }
 #ifdef LOB_ENABLE_ALLOCATION_AUDIT
@@ -567,10 +588,8 @@ template <typename Domain, typename Source>
 [[nodiscard]] std::vector<std::string> selected_workloads(
     const std::string& selection) {
   static const std::vector<std::string> all{
-      "mixed",          "cancel",   "unknown_cancel", "reduce",
-      "increase",       "noop",     "unknown_amend",  "noncross_add",
-      "fill1",          "fill4",    "fill16",         "fill64",
-      "fill256",        "multi_level"};
+      lob::benchmark::kCanonicalWorkloads.begin(),
+      lob::benchmark::kCanonicalWorkloads.end()};
   if (selection == "all") {
     return all;
   }
@@ -588,27 +607,7 @@ template <typename Domain, typename Source>
   if (options.mode == "smoke") {
     return 1'000;
   }
-  if (workload == "mixed" || workload == "unknown_cancel" ||
-      workload == "noop" || workload == "unknown_amend") {
-    return 1'000'000;
-  }
-  if (workload == "cancel" || workload == "reduce" ||
-      workload == "increase" || workload == "noncross_add") {
-    return 500'000;
-  }
-  if (workload == "fill1") {
-    return 200'000;
-  }
-  if (workload == "fill4") {
-    return 50'000;
-  }
-  if (workload == "fill16" || workload == "multi_level") {
-    return 20'000;
-  }
-  if (workload == "fill64") {
-    return 5'000;
-  }
-  return 1'000;
+  return lob::benchmark::canonical_sample_count(workload);
 }
 
 [[nodiscard]] std::int64_t top_price(lob::Side side,
@@ -1396,6 +1395,14 @@ void checksum_result(std::uint64_t& checksum,
       read_small_file(cpu_path + "/cpufreq/scaling_governor");
   result.frequency_khz =
       read_small_file(cpu_path + "/cpufreq/scaling_cur_freq");
+  result.scaling_driver =
+      read_small_file(cpu_path + "/cpufreq/scaling_driver");
+  result.scaling_min_khz =
+      read_small_file(cpu_path + "/cpufreq/scaling_min_freq");
+  result.scaling_max_khz =
+      read_small_file(cpu_path + "/cpufreq/scaling_max_freq");
+  result.energy_performance_preference =
+      read_small_file(cpu_path + "/cpufreq/energy_performance_preference");
   result.numa_node = "unavailable";
   for (int node = 0; node < 64; ++node) {
     const auto candidate = cpu_path + "/node" + std::to_string(node);
@@ -1464,14 +1471,19 @@ void write_distribution_json(
 #ifdef LOB_ENABLE_ALLOCATION_AUDIT
 [[nodiscard]] bool write_allocation_sidecar(
     const std::string& path, const Options& options,
+    const lob::benchmark::ExecutionProvenance& provenance,
     const std::vector<WorkloadRun>& runs) {
   std::ofstream output(path);
   if (!output) {
     return false;
   }
-  output << "LOB_PHASE2_POOL_ALLOCATION_V3 " << options.mode << ' '
+  output << "LOB_PHASE2_POOL_ALLOCATION_V4 " << options.mode << ' '
          << options.repetitions << ' ' << options.warmup << ' '
          << options.samples_override << ' ' << options.workload << '\n';
+  output << "PROVENANCE " << std::quoted(provenance.build.source_commit) << ' '
+         << (provenance.build.source_dirty_at_build ? 1 : 0) << ' '
+         << std::quoted(provenance.build.latency_sha256) << ' '
+         << std::quoted(provenance.build.allocation_sha256) << '\n';
   for (const auto& run : runs) {
     output << "TRACE " << run.workload << ' ' << run.seed << ' '
            << run.samples << ' ' << run.warmup << ' '
@@ -1499,7 +1511,8 @@ void write_distribution_json(
 #else
 
 [[nodiscard]] std::vector<AllocationKey> read_allocation_sidecar(
-    const std::string& path, const Options& options) {
+    const std::string& path, const Options& options,
+    const lob::benchmark::ExecutionProvenance& provenance) {
   std::ifstream input(path);
   std::vector<AllocationKey> records;
   std::string schema;
@@ -1510,13 +1523,26 @@ void write_distribution_json(
   std::string workload;
   if (!(input >> schema >> mode >> repetitions >> warmup >> samples_override >>
         workload) ||
-      schema != "LOB_PHASE2_POOL_ALLOCATION_V3" || mode != options.mode ||
+      schema != "LOB_PHASE2_POOL_ALLOCATION_V4" || mode != options.mode ||
       repetitions != options.repetitions || warmup != options.warmup ||
       samples_override != options.samples_override ||
       workload != options.workload) {
     return {};
   }
   std::string kind;
+  std::string source_commit;
+  int source_dirty = 1;
+  std::string latency_sha256;
+  std::string allocation_sha256;
+  if (!(input >> kind >> std::quoted(source_commit) >> source_dirty >>
+        std::quoted(latency_sha256) >> std::quoted(allocation_sha256)) ||
+      kind != "PROVENANCE" ||
+      source_commit != provenance.build.source_commit ||
+      source_dirty != (provenance.build.source_dirty_at_build ? 1 : 0) ||
+      latency_sha256 != provenance.build.latency_sha256 ||
+      allocation_sha256 != provenance.build.allocation_sha256) {
+    return {};
+  }
   while (input >> kind) {
     if (kind == "TRACE") {
       AllocationKey record;
@@ -1527,6 +1553,15 @@ void write_distribution_json(
           record.phases.trace_generation.allocated_bytes >>
           record.phases.trace_generation.deallocations;
       if (!input) {
+        return {};
+      }
+      const bool duplicate = std::any_of(
+          records.begin(), records.end(), [&](const auto& existing) {
+            return existing.workload == record.workload &&
+                   existing.seed == record.seed &&
+                   existing.repetition == record.repetition;
+          });
+      if (duplicate) {
         return {};
       }
       records.push_back(record);
@@ -1549,6 +1584,15 @@ void write_distribution_json(
     if (!input) {
       return {};
     }
+    const bool duplicate =
+        std::any_of(records.begin(), records.end(), [&](const auto& existing) {
+          return existing.workload == record.workload &&
+                 existing.seed == record.seed &&
+                 existing.repetition == record.repetition;
+        });
+    if (duplicate) {
+      return {};
+    }
     records.push_back(record);
   }
   return records;
@@ -1569,10 +1613,11 @@ void write_distribution_json(
 
 [[nodiscard]] bool write_json(const std::string& path, const Options& options,
                               const Environment& environment,
+                              const lob::benchmark::ExecutionProvenance&
+                                  provenance,
                               const std::vector<WorkloadRun>& runs,
-                              bool accepted) {
+                              bool local_gates_passed) {
   std::ostringstream output;
-  constexpr bool git_dirty = LOB_BENCHMARK_GIT_DIRTY;
   const bool allocation_audit_attached = !options.allocation_input.empty();
   allocation_audit::Counters benchmark_owned_timed_activity;
   allocation_audit::Counters process_timed_activity;
@@ -1604,7 +1649,14 @@ void write_distribution_json(
       benchmark_owned_timed_activity.allocations == 0 &&
       benchmark_owned_timed_activity.allocated_bytes == 0 &&
       benchmark_owned_timed_activity.deallocations == 0;
-  const bool canonical_run_accepted = accepted && options.mode == "acceptance";
+  const lob::benchmark::ExperimentConfiguration configuration{
+      options.mode, options.workload, options.seeds, options.samples_override,
+      options.warmup, options.repetitions, options.cpu};
+  const bool canonical_configuration_valid =
+      lob::benchmark::canonical_acceptance_configuration(configuration);
+  const bool local_acceptance_passed =
+      local_gates_passed && canonical_configuration_valid &&
+      provenance.canonical_eligible;
   const lob::StorageDiagnostics storage =
       runs.empty() || runs.front().repetitions.empty()
           ? lob::StorageDiagnostics{}
@@ -1628,7 +1680,7 @@ void write_distribution_json(
     }
   }
   output << std::fixed << std::setprecision(3)
-         << "{\n  \"schema\": \"lob.phase2.pool.performance.v1\",\n"
+         << "{\n  \"schema\": \"lob.phase2.pool.performance.v2\",\n"
          << "  \"baseline_profile\": \"phase2_pool_backed_storage\",\n"
          << "  \"primary_boundary\": \"public_process_completion\",\n"
          << "  \"matching_core_measured\": false,\n"
@@ -1637,14 +1689,30 @@ void write_distribution_json(
          << (allocation_audit_attached ? "true" : "false") << ",\n"
          << "  \"strict_zero_allocation_applicable\": true,\n"
          << "  \"strict_zero_allocation_enforcement_milestone\": 10,\n"
-         << "  \"git_commit\": \"" << LOB_BENCHMARK_GIT_COMMIT << "\",\n"
-         << "  \"git_dirty\": " << (git_dirty ? "true" : "false")
+         << "  \"git_commit\": \""
+         << json_escape(provenance.execution.execution_commit) << "\",\n"
+         << "  \"git_dirty\": "
+         << (provenance.execution.execution_tree_dirty ? "true" : "false")
          << ",\n"
-         << "  \"build_type\": \"Release\",\n"
-         << "  \"compile_flags\": \"-O3 -march=native -ffast-math "
-            "-Wall -Wextra -Werror -std=c++20 -DNDEBUG\",\n"
-         << "  \"link_flags\": \"-O3 -DNDEBUG\",\n"
+         << "  \"build_type\": \""
+         << json_escape(provenance.build.build_type) << "\",\n"
+         << "  \"compile_flags\": \""
+         << json_escape(provenance.build.latency_compile_flags) << "\",\n"
+         << "  \"link_flags\": \""
+         << json_escape(provenance.build.latency_link_flags) << "\",\n"
          << "  \"mode\": \"" << options.mode << "\",\n"
+         << "  \"canonical_configuration_valid\":"
+         << (canonical_configuration_valid ? "true" : "false") << ",\n"
+         << "  \"local_acceptance_passed\":"
+         << (local_acceptance_passed ? "true" : "false") << ",\n"
+         << "  \"baseline_comparison_status\":\"not_performed\",\n"
+         << "  \"final_canonical_acceptance\":false,\n"
+         << "  \"canonical_seeds\":[24301,12648430],\n"
+         << "  \"canonical_workload_count\":14,\n"
+         << "  \"canonical_warmup\":10000,\n"
+         << "  \"canonical_repetitions\":5,\n"
+         << "  \"sample_count_override\":"
+         << options.samples_override << ",\n"
          << "  \"execution_outbox_capacity\":"
          << lob::kDefaultExecutionOutboxCapacity << ",\n"
          << "  \"status_outbox_capacity\":"
@@ -1654,6 +1722,8 @@ void write_distribution_json(
          << "  \"trace_generation_completed_before_timing\":true,\n"
          << "  \"sample_and_result_buffers_presized_before_timing\":true,\n"
          << "  \"statistics_and_serialization_after_timing\":true,\n"
+         << "  \"percentile_convention\":"
+            "\"nearest_rank_per_repetition_median_of_five\",\n"
          << "  \"run_validity_passed\":"
          << (run_validity_passed ? "true" : "false") << ",\n"
          << "  \"allocation_policy_compliant\":"
@@ -1663,8 +1733,53 @@ void write_distribution_json(
          << "  \"public_process_completion_gate\":{"
             "\"p50_ns\":1500,\"p99_ns\":5000,\"p999_ns\":15000,"
             "\"throughput_per_second\":500000},\n"
-         << "  \"accepted_canonical_run\": "
-         << (canonical_run_accepted ? "true" : "false") << ",\n"
+         << "  \"provenance\":{\"manifest_loaded\":"
+         << (provenance.manifest_loaded ? "true" : "false")
+         << ",\"source_commit\":\""
+         << json_escape(provenance.build.source_commit)
+         << "\",\"source_dirty_at_build\":"
+         << (provenance.build.source_dirty_at_build ? "true" : "false")
+         << ",\"execution_commit\":\""
+         << json_escape(provenance.execution.execution_commit)
+         << "\",\"execution_tree_dirty\":"
+         << (provenance.execution.execution_tree_dirty ? "true" : "false")
+         << ",\"source_commit_matches\":"
+         << (provenance.source_commit_matches ? "true" : "false")
+         << ",\"latency_executable_sha256\":\""
+         << provenance.build.latency_sha256
+         << "\",\"allocation_audit_executable_sha256\":\""
+         << provenance.build.allocation_sha256
+         << "\",\"both_binary_hashes_match\":"
+         << (provenance.both_binary_hashes_match ? "true" : "false")
+         << ",\"executing_expected_binary\":"
+         << (provenance.execution.executing_expected_binary ? "true"
+                                                            : "false")
+         << ",\"compiler_id\":\""
+         << json_escape(provenance.build.compiler_id)
+         << "\",\"compiler_version\":\""
+         << json_escape(provenance.build.compiler_version)
+         << "\",\"compiler_banner\":\""
+         << json_escape(provenance.build.compiler_banner)
+         << "\",\"latency_compile_command\":\""
+         << json_escape(provenance.build.latency_compile_command)
+         << "\",\"latency_compile_flags\":\""
+         << json_escape(provenance.build.latency_compile_flags)
+         << "\",\"latency_link_command\":\""
+         << json_escape(provenance.build.latency_link_command)
+         << "\",\"latency_link_flags\":\""
+         << json_escape(provenance.build.latency_link_flags)
+         << "\",\"allocation_compile_command\":\""
+         << json_escape(provenance.build.allocation_compile_command)
+         << "\",\"allocation_compile_flags\":\""
+         << json_escape(provenance.build.allocation_compile_flags)
+         << "\",\"allocation_link_command\":\""
+         << json_escape(provenance.build.allocation_link_command)
+         << "\",\"allocation_link_flags\":\""
+         << json_escape(provenance.build.allocation_link_flags)
+         << "\",\"release_configuration_valid\":"
+         << (provenance.release_configuration_valid ? "true" : "false")
+         << ",\"canonical_eligible\":"
+         << (provenance.canonical_eligible ? "true" : "false") << "},\n"
          << "  \"storage_memory\":{\"active_order_capacity\":"
          << storage.configured_active_order_capacity
          << ",\"order_node_size\":" << storage.order_node_size
@@ -1699,9 +1814,18 @@ void write_distribution_json(
          << environment.affinity << "\",\"smt_sibling\":\""
          << environment.sibling << "\",\"sibling_occupancy\":\""
          << json_escape(environment.sibling_occupancy) << '"'
-         << ",\"governor\":\"" << environment.governor
-         << "\",\"frequency_khz\":\"" << environment.frequency_khz
-         << "\",\"numa_node\":\"" << environment.numa_node
+         << ",\"governor\":\"" << json_escape(environment.governor)
+         << "\",\"frequency_khz\":\""
+         << json_escape(environment.frequency_khz)
+         << "\",\"scaling_driver\":\""
+         << json_escape(environment.scaling_driver)
+         << "\",\"scaling_min_khz\":\""
+         << json_escape(environment.scaling_min_khz)
+         << "\",\"scaling_max_khz\":\""
+         << json_escape(environment.scaling_max_khz)
+         << "\",\"energy_performance_preference\":\""
+         << json_escape(environment.energy_performance_preference)
+         << "\",\"numa_node\":\"" << json_escape(environment.numa_node)
          << "\",\"clock\":\"std::chrono::steady_clock/CLOCK_MONOTONIC\""
          << ",\"clock_resolution_ns\":" << environment.clock_resolution_ns
          << ",\"clock_overhead\":"
@@ -1883,8 +2007,10 @@ void write_distribution_json(
 [[nodiscard]] bool write_report(const std::string& path,
                                 const Options& options,
                                 const Environment& environment,
+                                const lob::benchmark::ExecutionProvenance&
+                                    provenance,
                                 const std::vector<WorkloadRun>& runs,
-                                bool accepted) {
+                                bool local_gates_passed) {
   if (path.empty()) {
     return true;
   }
@@ -1900,6 +2026,13 @@ void write_distribution_json(
           : runs.front().repetitions.front().storage;
   allocation_audit::Counters construction_total;
   allocation_audit::Counters destruction_total;
+  const lob::benchmark::ExperimentConfiguration configuration{
+      options.mode, options.workload, options.seeds, options.samples_override,
+      options.warmup, options.repetitions, options.cpu};
+  const bool locally_accepted =
+      local_gates_passed &&
+      lob::benchmark::canonical_acceptance_configuration(configuration) &&
+      provenance.canonical_eligible;
   for (const auto& run : runs) {
     for (const auto& repetition : run.repetitions) {
       construction_total.allocations +=
@@ -1916,12 +2049,21 @@ void write_distribution_json(
           repetition.allocations.destruction.deallocations;
     }
   }
-  output << "# Phase 2 Pool-backed Storage Baseline\n\n"
+  output << "# Phase 2 Pool-backed Storage Candidate\n\n"
          << "Profile: `phase2_pool_backed_storage`\n\n"
          << "Boundary: public `MatchingEngine::process()` entry through "
             "return\n\n"
-         << "Accepted canonical run: "
-         << (accepted && options.mode == "acceptance" ? "yes" : "no")
+         << "Canonical configuration valid: "
+         << (lob::benchmark::canonical_acceptance_configuration(configuration)
+                 ? "yes"
+                 : "no")
+         << "\n\n"
+         << "Local acceptance: " << (locally_accepted ? "pass" : "fail")
+         << "\n\n"
+         << "Baseline comparison: not performed\n\n"
+         << "Final canonical acceptance: no\n\n"
+         << "A locally accepted candidate is not a final canonical result "
+            "until the retained Phase 1 comparison passes."
          << "\n\n"
          << "The matching-core endpoint was not independently measured. "
             "Report-producing commands include outbox cursor publication; "
@@ -1941,19 +2083,35 @@ void write_distribution_json(
             "prices outside timing, so every target really sweeps four "
             "levels.\n\n"
          << "## Environment\n\n"
-         << "- Git: `" << LOB_BENCHMARK_GIT_COMMIT << "` (dirty: "
-         << (LOB_BENCHMARK_GIT_DIRTY ? "yes" : "no") << ")\n"
+         << "- Measured source: `" << provenance.build.source_commit
+         << "` (dirty at build: "
+         << (provenance.build.source_dirty_at_build ? "yes" : "no")
+         << ", dirty at execution: "
+         << (provenance.execution.execution_tree_dirty ? "yes" : "no")
+         << ")\n"
+         << "- Latency executable SHA-256: `"
+         << provenance.build.latency_sha256 << "`\n"
+         << "- Allocation-audit executable SHA-256: `"
+         << provenance.build.allocation_sha256 << "`\n"
+         << "- Runtime provenance verification: "
+         << (provenance.canonical_eligible ? "canonical-eligible" : "diagnostic")
+         << "\n"
          << "- CPU: " << environment.cpu_model << "\n"
          << "- Microcode: " << environment.microcode << "\n"
          << "- Kernel: " << environment.kernel << "\n"
-         << "- Compiler: " << environment.compiler << "\n"
-         << "- Flags: `-O3 -march=native -ffast-math -Wall -Wextra -Werror "
-            "-std=c++20 -DNDEBUG`\n"
+         << "- Compiler: " << provenance.build.compiler_banner << "\n"
+         << "- Compile flags: `" << provenance.build.latency_compile_flags
+         << "`\n"
+         << "- Link flags: `" << provenance.build.latency_link_flags << "`\n"
          << "- Affinity: " << environment.affinity << "\n"
          << "- SMT sibling: " << environment.sibling
          << " (" << environment.sibling_occupancy << ")\n"
-         << "- Governor/frequency: " << environment.governor << " / "
-         << environment.frequency_khz << " kHz\n"
+         << "- Frequency policy: driver " << environment.scaling_driver
+         << ", governor " << environment.governor << ", range "
+         << environment.scaling_min_khz << "--"
+         << environment.scaling_max_khz << " kHz, preference "
+         << environment.energy_performance_preference << "\n"
+         << "- Observed frequency: " << environment.frequency_khz << " kHz\n"
          << "- NUMA node: " << environment.numa_node << "\n"
          << "- Clock: `std::chrono::steady_clock` backed by monotonic clock; "
             "resolution "
@@ -2053,10 +2211,15 @@ void write_distribution_json(
     }
   }
   output << "\nNearest-rank percentiles are computed independently per "
-            "repetition; the table reports the median of repetition metrics. "
-            "At least four of five repetitions must pass each applicable "
-            "public-path gate. Multi-fill matching-core ceilings are "
-            "informational conservative evidence only.\n\n"
+            "repetition; the table reports the median of repetition metrics. ";
+  if (options.mode == "acceptance") {
+    output << "Exactly four of five or five of five repetitions must pass "
+              "each applicable public-path gate. ";
+  } else {
+    output << "This noncanonical run does not establish final acceptance. ";
+  }
+  output << "Multi-fill matching-core ceilings are informational conservative "
+            "evidence only.\n\n"
          << "## Allocation classification\n\n"
          << "Global allocation overrides were enabled only in the separate "
             "audit executable. Strict validity requires both timed public "
@@ -2106,7 +2269,8 @@ void write_distribution_json(
   if (options.cpu >= 0) {
     output << " --cpu " << options.cpu;
   }
-  output << " --allocation-output <path>\n"
+  output << " --sibling-occupancy " << options.sibling_occupancy
+         << " --allocation-output <path>\n"
          << "./build/release/benchmarks/lob_phase2_pool_benchmark --mode "
          << options.mode << " --workload " << options.workload
          << " --seeds ";
@@ -2124,8 +2288,12 @@ void write_distribution_json(
   if (options.cpu >= 0) {
     output << " --cpu " << options.cpu;
   }
-  output << " --sibling-occupancy " << options.sibling_occupancy;
-  output << " --allocation-input <path> --json <path> --report <path>\n```\n";
+  output << " --sibling-occupancy " << options.sibling_occupancy
+         << " --allocation-input <path> --json <local-path> "
+            "--report <local-path>\n"
+         << "python3 benchmarks/compare_phase2.py --baseline <phase1-v2.json> "
+            "--candidate <local-path> --output-json <final-path> "
+            "--report <comparison-path>\n```\n";
   return static_cast<bool>(output);
 }
 #endif
@@ -2135,12 +2303,13 @@ void write_distribution_json(
 int main(int argc, char** argv) {
   const auto parsed = parse_options(argc, argv);
   if (!parsed) {
-    std::cerr << "usage: phase2 pool benchmark --mode smoke|acceptance "
+    std::cerr << "usage: phase2 pool benchmark "
+                 "--mode smoke|exploratory|acceptance "
                  "[--workload all|NAME] [--seeds N[,N]] [--samples N] "
                  "[--warmup N] [--repetitions N] [--cpu N] [--json PATH] "
                  "[--sibling-occupancy LABEL] "
                  "[--report PATH] [--allocation-input PATH] "
-                 "[--allocation-output PATH]\n";
+                 "[--allocation-output PATH] [--provenance PATH]\n";
     return 2;
   }
   const auto options = *parsed;
@@ -2149,13 +2318,31 @@ int main(int argc, char** argv) {
     std::cerr << "invalid workload or CPU affinity request\n";
     return 2;
   }
+  const auto provenance_path =
+      options.provenance_path.empty()
+          ? lob::benchmark::default_provenance_path()
+          : options.provenance_path;
+#ifdef LOB_ENABLE_ALLOCATION_AUDIT
+  const auto provenance = lob::benchmark::collect_execution_provenance(
+      provenance_path, lob::benchmark::BenchmarkBinaryRole::AllocationAudit);
+#else
+  const auto provenance = lob::benchmark::collect_execution_provenance(
+      provenance_path, lob::benchmark::BenchmarkBinaryRole::Latency);
+#endif
+  if (options.mode == "acceptance" && !provenance.canonical_eligible) {
+    std::cerr << "acceptance requires a clean committed Release build with "
+                 "verified source and executable provenance\n";
+    return 2;
+  }
 
   std::vector<AllocationKey> allocation_records;
 #ifndef LOB_ENABLE_ALLOCATION_AUDIT
   if (!options.allocation_input.empty()) {
     allocation_records = read_allocation_sidecar(options.allocation_input,
-                                                  options);
-    if (allocation_records.empty()) {
+                                                  options, provenance);
+    const auto expected_records = workloads.size() * options.seeds.size() *
+                                  (options.repetitions + 1);
+    if (allocation_records.size() != expected_records) {
       std::cerr << "allocation sidecar does not match run configuration\n";
       return 2;
     }
@@ -2223,9 +2410,8 @@ int main(int argc, char** argv) {
         }
       }
       const auto required_passes =
-          options.repetitions >= 5
-              ? (options.repetitions * 4 + 4) / 5
-              : options.repetitions;
+          options.mode == "acceptance" ? std::size_t{4}
+                                       : options.repetitions;
       run.performance_gate_compliant =
           !run.public_gate_applicable ||
           run.public_gate_passes >= required_passes;
@@ -2271,14 +2457,16 @@ int main(int argc, char** argv) {
   }
 
 #ifdef LOB_ENABLE_ALLOCATION_AUDIT
-  if (!write_allocation_sidecar(options.allocation_output, options, runs)) {
+  if (!write_allocation_sidecar(options.allocation_output, options, provenance,
+                                runs)) {
     std::cerr << "failed to write allocation sidecar\n";
     return 1;
   }
 #else
-  if (!write_json(options.json_path, options, environment, runs, accepted) ||
-      !write_report(options.report_path, options, environment, runs,
-                    accepted)) {
+  if (!write_json(options.json_path, options, environment, provenance, runs,
+                  accepted) ||
+      !write_report(options.report_path, options, environment, provenance,
+                    runs, accepted)) {
     std::cerr << "failed to write result artifacts\n";
     return 1;
   }
