@@ -1,4 +1,5 @@
 add_subdirectory(fixtures)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 add_executable(lob_smoke_test smoke_test.cpp)
 target_link_libraries(lob_smoke_test PRIVATE lob::engine lob::test_fixtures)
@@ -56,6 +57,7 @@ add_executable(
   lob_benchmark_support_test
   benchmark_support_test.cpp
   ../benchmarks/benchmark_support.cpp
+  ../benchmarks/benchmark_provenance.cpp
 )
 target_include_directories(
   lob_benchmark_support_test PRIVATE ${CMAKE_SOURCE_DIR}/benchmarks
@@ -81,6 +83,29 @@ add_test(
 )
 add_test(NAME lob.benchmark_support COMMAND lob_benchmark_support_test)
 add_test(
+  NAME lob.benchmark_comparator
+  COMMAND
+    ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/compare_phase2_test.py
+    ${CMAKE_SOURCE_DIR}/benchmarks/compare_phase2.py
+)
+add_test(
+  NAME lob.benchmark_cli_contract
+  COMMAND
+    ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_cli_test.py
+    $<TARGET_FILE:lob_phase2_pool_benchmark>
+)
+add_test(
+  NAME lob.benchmark_allocation_sidecar_smoke
+  COMMAND
+    ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_sidecar_smoke_test.py
+    $<TARGET_FILE:lob_phase2_pool_allocation_audit>
+    $<TARGET_FILE:lob_phase2_pool_benchmark>
+    ${CMAKE_CURRENT_BINARY_DIR}/phase2_benchmark_smoke.alloc
+)
+add_test(
   NAME lob.benchmark_smoke
   COMMAND lob_phase2_pool_benchmark
     --mode smoke
@@ -92,7 +117,8 @@ add_test(
 )
 set_tests_properties(
   lob.benchmark_smoke
-  PROPERTIES PASS_REGULAR_EXPRESSION "\"schema\": \"lob.phase2.pool.performance.v1\""
+  PROPERTIES
+    PASS_REGULAR_EXPRESSION "\"schema\": \"lob.phase2.pool.performance.v2\""
 )
 add_test(
   NAME lob.fixed_object_pool_benchmark_smoke
