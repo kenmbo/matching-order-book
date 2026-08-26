@@ -1,5 +1,7 @@
 #include "benchmark_support.hpp"
+#include "benchmark_provenance.hpp"
 
+#include <array>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -111,6 +113,89 @@ void test_gates_and_schema(Checks& checks) {
                  "checksum stability");
 }
 
+void test_canonical_configuration(Checks& checks) {
+  const std::array<std::uint64_t, 2> seeds{24301, 12648430};
+  lob::benchmark::ExperimentConfiguration configuration{
+      "acceptance", "all", seeds, 0, 10'000, 5, 1};
+  checks.require(
+      lob::benchmark::canonical_acceptance_configuration(configuration),
+      "exact canonical acceptance configuration");
+
+  const std::array<std::uint64_t, 2> duplicate{24301, 24301};
+  checks.require(!lob::benchmark::distinct_seeds(duplicate),
+                 "duplicate seeds rejected");
+  configuration.seeds = duplicate;
+  checks.require(
+      !lob::benchmark::canonical_acceptance_configuration(configuration),
+      "duplicate canonical seeds rejected");
+  configuration.seeds = seeds;
+  ++configuration.warmup;
+  checks.require(
+      !lob::benchmark::canonical_acceptance_configuration(configuration),
+      "noncanonical warm-up rejected");
+  --configuration.warmup;
+  ++configuration.repetitions;
+  checks.require(
+      !lob::benchmark::canonical_acceptance_configuration(configuration),
+      "noncanonical repetition count rejected");
+  --configuration.repetitions;
+  configuration.samples_override = 1;
+  checks.require(
+      !lob::benchmark::canonical_acceptance_configuration(configuration),
+      "sample override rejected");
+  configuration.samples_override = 0;
+  configuration.mode = "exploratory";
+  checks.require(
+      !lob::benchmark::canonical_acceptance_configuration(configuration),
+      "exploratory mode is never canonical");
+  checks.require(lob::benchmark::canonical_sample_count("mixed") ==
+                         1'000'000 &&
+                     lob::benchmark::canonical_sample_count("fill256") ==
+                         1'000 &&
+                     lob::benchmark::canonical_sample_count("invalid") == 0,
+                 "canonical per-workload sample counts");
+}
+
+void test_provenance_policy(Checks& checks) {
+  lob::benchmark::BuildProvenance build;
+  build.source_commit = std::string(40, '1');
+  build.source_dirty_at_build = false;
+  build.build_type = "Release";
+  build.compiler_id = "GNU";
+  build.compiler_version = "12.2.0";
+  build.compiler_banner = "g++ 12.2.0";
+  build.latency_sha256 = std::string(64, 'a');
+  build.allocation_sha256 = std::string(64, 'b');
+  build.latency_compile_flags =
+      "-O3 -DNDEBUG -Wall -Wextra -Werror -march=native -ffast-math "
+      "-std=c++20";
+  build.latency_link_flags = "-O3 -DNDEBUG";
+  lob::benchmark::ProvenanceVerificationInputs execution;
+  execution.execution_commit = build.source_commit;
+  execution.execution_tree_dirty = false;
+  execution.actual_latency_sha256 = build.latency_sha256;
+  execution.actual_allocation_sha256 = build.allocation_sha256;
+  execution.executing_expected_binary = true;
+  auto verified = lob::benchmark::verify_build_provenance(build, execution);
+  checks.require(verified.canonical_eligible,
+                 "clean matching Release provenance is eligible");
+
+  execution.execution_tree_dirty = true;
+  verified = lob::benchmark::verify_build_provenance(build, execution);
+  checks.require(!verified.canonical_eligible,
+                 "dirty execution provenance rejected");
+  execution.execution_tree_dirty = false;
+  execution.actual_latency_sha256 = std::string(64, 'c');
+  verified = lob::benchmark::verify_build_provenance(build, execution);
+  checks.require(!verified.canonical_eligible,
+                 "binary hash mismatch rejected");
+  execution.actual_latency_sha256 = build.latency_sha256;
+  build.source_dirty_at_build = true;
+  verified = lob::benchmark::verify_build_provenance(build, execution);
+  checks.require(!verified.canonical_eligible,
+                 "dirty build provenance rejected");
+}
+
 }  // namespace
 
 int main() {
@@ -118,5 +203,7 @@ int main() {
   test_mix(checks);
   test_volume_and_percentiles(checks);
   test_gates_and_schema(checks);
+  test_canonical_configuration(checks);
+  test_provenance_policy(checks);
   return checks.passed() ? 0 : 1;
 }
