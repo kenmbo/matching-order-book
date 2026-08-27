@@ -116,7 +116,7 @@ void test_gates_and_schema(Checks& checks) {
 void test_canonical_configuration(Checks& checks) {
   const std::array<std::uint64_t, 2> seeds{24301, 12648430};
   lob::benchmark::ExperimentConfiguration configuration{
-      "acceptance", "all", seeds, 0, 10'000, 5, 1};
+      "acceptance", "all", seeds, 0, 10'000, 5, 1, "sibling_idle"};
   checks.require(
       lob::benchmark::canonical_acceptance_configuration(configuration),
       "exact canonical acceptance configuration");
@@ -148,12 +148,38 @@ void test_canonical_configuration(Checks& checks) {
   checks.require(
       !lob::benchmark::canonical_acceptance_configuration(configuration),
       "exploratory mode is never canonical");
-  checks.require(lob::benchmark::canonical_sample_count("mixed") ==
-                         1'000'000 &&
-                     lob::benchmark::canonical_sample_count("fill256") ==
-                         1'000 &&
+  configuration.mode = "acceptance";
+  configuration.sibling_occupancy = {};
+  checks.require(
+      !lob::benchmark::canonical_acceptance_configuration(configuration),
+      "empty sibling policy rejected");
+  configuration.sibling_occupancy = "not_observed";
+  checks.require(
+      !lob::benchmark::canonical_acceptance_configuration(configuration),
+      "unobserved sibling policy rejected");
+
+  constexpr std::array<std::size_t, 14> expected_samples{
+      1'000'000, 500'000, 1'000'000, 500'000, 500'000, 1'000'000, 1'000'000,
+      500'000,   200'000, 50'000,     20'000,  5'000,   1'000,     20'000};
+  constexpr std::array<std::string_view, 14> expected_workloads{
+      "mixed",          "cancel",   "unknown_cancel", "reduce",
+      "increase",       "noop",     "unknown_amend",  "noncross_add",
+      "fill1",          "fill4",    "fill16",         "fill64",
+      "fill256",        "multi_level"};
+  checks.require(lob::benchmark::kCanonicalWorkloads == expected_workloads,
+                 "canonical workload names and order");
+  bool sample_counts_match = true;
+  for (std::size_t index = 0;
+       index < lob::benchmark::kCanonicalWorkloads.size(); ++index) {
+    sample_counts_match =
+        sample_counts_match &&
+        lob::benchmark::canonical_sample_count(
+            lob::benchmark::kCanonicalWorkloads[index]) ==
+            expected_samples[index];
+  }
+  checks.require(sample_counts_match &&
                      lob::benchmark::canonical_sample_count("invalid") == 0,
-                 "canonical per-workload sample counts");
+                 "all canonical per-workload sample counts");
 }
 
 void test_provenance_policy(Checks& checks) {
@@ -170,6 +196,9 @@ void test_provenance_policy(Checks& checks) {
       "-O3 -DNDEBUG -Wall -Wextra -Werror -march=native -ffast-math "
       "-std=c++20";
   build.latency_link_flags = "-O3 -DNDEBUG";
+  build.allocation_compile_flags =
+      build.latency_compile_flags + " -DLOB_ENABLE_ALLOCATION_AUDIT=1";
+  build.allocation_link_flags = build.latency_link_flags;
   lob::benchmark::ProvenanceVerificationInputs execution;
   execution.execution_commit = build.source_commit;
   execution.execution_tree_dirty = false;
@@ -190,6 +219,27 @@ void test_provenance_policy(Checks& checks) {
   checks.require(!verified.canonical_eligible,
                  "binary hash mismatch rejected");
   execution.actual_latency_sha256 = build.latency_sha256;
+  execution.actual_allocation_sha256 = std::string(64, 'c');
+  verified = lob::benchmark::verify_build_provenance(build, execution);
+  checks.require(!verified.canonical_eligible,
+                 "stale allocation-audit hash rejected");
+  execution.actual_allocation_sha256 = build.allocation_sha256;
+  execution.executing_expected_binary = false;
+  verified = lob::benchmark::verify_build_provenance(build, execution);
+  checks.require(!verified.canonical_eligible,
+                 "wrong executable identity rejected");
+  execution.executing_expected_binary = true;
+  execution.execution_commit = std::string(40, '2');
+  verified = lob::benchmark::verify_build_provenance(build, execution);
+  checks.require(!verified.canonical_eligible,
+                 "build and execution commit mismatch rejected");
+  execution.execution_commit = build.source_commit;
+  build.allocation_compile_flags.clear();
+  verified = lob::benchmark::verify_build_provenance(build, execution);
+  checks.require(!verified.canonical_eligible,
+                 "allocation-audit Release flags required");
+  build.allocation_compile_flags =
+      build.latency_compile_flags + " -DLOB_ENABLE_ALLOCATION_AUDIT=1";
   build.source_dirty_at_build = true;
   verified = lob::benchmark::verify_build_provenance(build, execution);
   checks.require(!verified.canonical_eligible,
