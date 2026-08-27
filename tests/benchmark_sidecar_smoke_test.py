@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -51,6 +52,20 @@ def main() -> int:
         raise RuntimeError("latency smoke schema mismatch")
     if not result["allocation_audit_attached"]:
         raise RuntimeError("latency smoke did not consume allocation evidence")
+    provenance = result["provenance"]
+    if not (
+        provenance["manifest_loaded"]
+        and provenance["source_commit_matches"]
+        and provenance["both_binary_hashes_match"]
+        and provenance["executing_expected_binary"]
+    ):
+        raise RuntimeError("build/execution provenance was not verified")
+    for field in (
+        "latency_executable_sha256",
+        "allocation_audit_executable_sha256",
+    ):
+        if re.fullmatch(r"[0-9a-f]{64}", provenance[field]) is None:
+            raise RuntimeError(f"invalid provenance digest: {field}")
     if (
         result["timed_process_allocation_count"] != 0
         or result["timed_process_allocated_bytes"] != 0
