@@ -117,6 +117,8 @@ def workload(name: str, seed: int, zero_allocations: bool) -> dict[str, object]:
                 "emitted_event_count_distribution": {str(fills): samples},
                 "active_range": [5_000, 6_000],
                 "level_range": [10, 20],
+                "starting_cpu": 2,
+                "ending_cpu": 2,
                 "timed_allocations": {
                     "allocations": 0 if zero_allocations else 1,
                     "allocated_bytes": 0 if zero_allocations else 64,
@@ -187,6 +189,12 @@ def artifact(baseline: bool) -> dict[str, object]:
         "compile_flags": build["latency_compile_flags"],
         "link_flags": build["latency_link_flags"],
         "mode": "acceptance",
+        "allocation_policy": (
+            "phase1_storage_diagnostic" if baseline else "strict_total_zero"
+        ),
+        "allocation_audit_attached": True,
+        "strict_zero_allocation_applicable": not baseline,
+        "strict_zero_allocation_enforcement_milestone": 10,
         "canonical_configuration_valid": True,
         "local_acceptance_passed": True,
         "baseline_comparison_status": "not_required" if baseline else "not_performed",
@@ -203,6 +211,7 @@ def artifact(baseline: bool) -> dict[str, object]:
         "sample_and_result_buffers_presized_before_timing": True,
         "statistics_and_serialization_after_timing": True,
         "percentile_convention": "nearest_rank_per_repetition_median_of_five",
+        "public_process_completion_gate": copy.deepcopy(compare_phase2.PUBLIC_GATE),
         "run_validity_passed": True,
         "allocation_policy_compliant": True,
         "performance_gate_compliant": True,
@@ -214,6 +223,19 @@ def artifact(baseline: bool) -> dict[str, object]:
             for name in compare_phase2.CANONICAL_WORKLOADS
         ],
     }
+    repetition_count = len(result["workloads"]) * 5  # type: ignore[arg-type]
+    process_value = repetition_count if baseline else 0
+    result.update(
+        {
+            "timed_process_allocation_count": process_value,
+            "timed_process_allocated_bytes": process_value * 64,
+            "timed_process_deallocation_count": process_value,
+            "timed_benchmark_owned_allocation_count": 0,
+            "timed_benchmark_owned_allocated_bytes": 0,
+            "timed_benchmark_owned_deallocation_count": 0,
+            "timed_benchmark_owned_allocations_zero": True,
+        }
+    )
     if baseline:
         result["accepted_canonical_baseline"] = True
     return result
@@ -295,6 +317,24 @@ class ComparatorTests(unittest.TestCase):
         changed["provenance"]["latency_compile_flags"] += " -fomit-frame-pointer"  # type: ignore[index,operator]
         changed["compile_flags"] = changed["provenance"]["latency_compile_flags"]  # type: ignore[index]
         self.rejected(candidate=changed)
+        changed = copy.deepcopy(self.candidate)
+        changed["provenance"]["allocation_link_flags"] += " -fsanitize=address"  # type: ignore[index,operator]
+        self.rejected(candidate=changed)
+
+    def test_pinning_and_allocation_evidence_mismatch_rejected(self) -> None:
+        changed = copy.deepcopy(self.candidate)
+        changed["workloads"][0]["repetition_results"][0]["ending_cpu"] = 3  # type: ignore[index]
+        self.rejected(candidate=changed)
+        changed = copy.deepcopy(self.candidate)
+        changed["timed_process_allocation_count"] = 1
+        self.rejected(candidate=changed)
+        changed = copy.deepcopy(self.candidate)
+        changed["workloads"][0]["repetition_results"][0][  # type: ignore[index]
+            "timed_sample_collection_allocations"
+        ]["allocations"] = 1
+        changed["timed_benchmark_owned_allocation_count"] = 1
+        changed["timed_benchmark_owned_allocations_zero"] = False
+        self.rejected(candidate=changed)
 
     def test_timing_configuration_mismatch_rejected(self) -> None:
         changed = copy.deepcopy(self.candidate)
@@ -330,12 +370,18 @@ class ComparatorTests(unittest.TestCase):
         baseline = copy.deepcopy(self.baseline)
         baseline["accepted_canonical_baseline"] = False
         self.rejected(baseline=baseline)
+        baseline = copy.deepcopy(self.baseline)
+        baseline["baseline_comparison_status"] = "failed"
+        self.rejected(baseline=baseline)
         candidate = copy.deepcopy(self.candidate)
         candidate["local_acceptance_passed"] = False
         self.rejected(candidate=candidate)
         prior_failure = copy.deepcopy(self.candidate)
         prior_failure["baseline_comparison_status"] = "failed"
         self.rejected(candidate=prior_failure)
+        stale_comparison = copy.deepcopy(self.candidate)
+        stale_comparison["baseline_comparison"] = {"status": "failed"}
+        self.rejected(candidate=stale_comparison)
 
     def test_cli_is_idempotent_and_keeps_inputs_immutable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

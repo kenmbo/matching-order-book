@@ -49,6 +49,7 @@ class BenchmarkCliTests(unittest.TestCase):
             common[:9] + ("6",) + common[10:],
             common[:5] + ("24301",) + common[6:],
             common[:-4],
+            common[:-1] + ("",),
         )
         for arguments in cases:
             with self.subTest(arguments=arguments):
