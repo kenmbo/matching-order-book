@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import os
 from pathlib import Path
 import re
+import shlex
 import sys
 import tempfile
 from typing import Any
@@ -120,8 +122,17 @@ PROVENANCE_COMPARISON_FIELDS = (
     "compiler_banner",
     "latency_compile_flags",
     "latency_link_flags",
+    "allocation_compile_flags",
+    "allocation_link_flags",
 )
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+PUBLIC_GATE = {
+    "p50_ns": 1_500,
+    "p99_ns": 5_000,
+    "p999_ns": 15_000,
+    "throughput_per_second": 500_000,
+}
+COUNTER_FIELDS = ("allocations", "allocated_bytes", "deallocations")
 
 
 class ValidationError(ValueError):
@@ -144,6 +155,58 @@ def load_object(path: Path) -> dict[str, Any]:
 
 def percentage(delta: float, baseline: float) -> float | None:
     return None if baseline == 0 else delta * 100.0 / baseline
+
+
+def finite_nonnegative_number(value: object) -> bool:
+    return (
+        type(value) in (int, float)
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
+def flag_tokens(value: object) -> set[str]:
+    require(isinstance(value, str), "build flags are not a string")
+    try:
+        return set(shlex.split(value))
+    except ValueError as error:
+        raise ValidationError(f"cannot parse build flags: {error}") from error
+
+
+def validate_release_flags(provenance: dict[str, Any], label: str) -> None:
+    required_compile = {
+        "-O3",
+        "-march=native",
+        "-ffast-math",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-std=c++20",
+        "-DNDEBUG",
+    }
+    incompatible = {"-O0", "-O1", "-O2", "-Og"}
+    for role in ("latency", "allocation"):
+        compile_tokens = flag_tokens(provenance.get(f"{role}_compile_flags"))
+        link_tokens = flag_tokens(provenance.get(f"{role}_link_flags"))
+        require(
+            required_compile <= compile_tokens,
+            f"{label} {role} compile flags are not canonical Release flags",
+        )
+        require(
+            not (compile_tokens & incompatible)
+            and not any(value.startswith("-fsanitize=") for value in compile_tokens),
+            f"{label} {role} compile flags contain incompatible options",
+        )
+        require(
+            {"-O3", "-DNDEBUG"} <= link_tokens
+            and not any(value.startswith("-fsanitize=") for value in link_tokens),
+            f"{label} {role} link flags are not canonical Release flags",
+        )
+    allocation_tokens = flag_tokens(provenance.get("allocation_compile_flags"))
+    require(
+        "-DLOB_ENABLE_ALLOCATION_AUDIT=1" in allocation_tokens,
+        f"{label} allocation-audit compile definition is missing",
+    )
 
 
 def canonical_keys() -> list[tuple[str, int]]:
@@ -193,6 +256,11 @@ def validate_provenance(artifact: dict[str, Any], label: str) -> None:
             f"{label} {field} is not a SHA-256 digest",
         )
     require(
+        provenance["latency_executable_sha256"]
+        != provenance["allocation_audit_executable_sha256"],
+        f"{label} benchmark executable identities are not distinct",
+    )
+    require(
         artifact.get("build_type") == "Release",
         f"{label} is not a Release build",
     )
@@ -204,9 +272,30 @@ def validate_provenance(artifact: dict[str, Any], label: str) -> None:
         artifact.get("link_flags") == provenance.get("latency_link_flags"),
         f"{label} link flags are not tied to build provenance",
     )
+    for field in (
+        "compiler_id",
+        "compiler_version",
+        "compiler_banner",
+        "latency_compile_command",
+        "latency_link_command",
+        "allocation_compile_command",
+        "allocation_link_command",
+    ):
+        require(
+            isinstance(provenance.get(field), str) and bool(provenance[field]),
+            f"{label} provenance {field} is missing",
+        )
+    require(
+        provenance.get("compiler_id") == "GNU"
+        and provenance.get("compiler_version") == "12.2.0",
+        f"{label} compiler profile is not GNU 12.2.0",
+    )
+    validate_release_flags(provenance, label)
 
 
-def validate_repetitions(workload: dict[str, Any], label: str) -> None:
+def validate_repetitions(
+    workload: dict[str, Any], label: str, pinned_cpu: int
+) -> None:
     repetitions = workload.get("repetition_results")
     require(isinstance(repetitions, list), f"{label} repetitions are missing")
     require(len(repetitions) == 5, f"{label} must contain exactly five repetitions")
@@ -223,9 +312,18 @@ def validate_repetitions(workload: dict[str, Any], label: str) -> None:
         )
         for field in (*LATENCY_FIELDS, "throughput_per_second"):
             require(
-                isinstance(statistics.get(field), (int, float)),
-                f"{label} repetition statistic {field} is missing",
+                finite_nonnegative_number(statistics.get(field)),
+                f"{label} repetition statistic {field} is invalid",
             )
+        require(
+            finite_nonnegative_number(statistics.get("total_timed_ns")),
+            f"{label} repetition total timing is invalid",
+        )
+        require(
+            repetition.get("starting_cpu") == pinned_cpu
+            and repetition.get("ending_cpu") == pinned_cpu,
+            f"{label} repetition did not remain on the pinned CPU",
+        )
         for field in SEMANTIC_FIELDS:
             require(field in repetition, f"{label} semantic field {field} is missing")
     for field in SEMANTIC_FIELDS:
@@ -236,7 +334,7 @@ def validate_repetitions(workload: dict[str, Any], label: str) -> None:
 
 
 def validate_workloads(
-    artifact: dict[str, Any], label: str
+    artifact: dict[str, Any], label: str, pinned_cpu: int
 ) -> dict[tuple[str, int], dict[str, Any]]:
     workloads = artifact.get("workloads")
     require(isinstance(workloads, list), f"{label} workloads are missing")
@@ -281,10 +379,10 @@ def validate_workloads(
         require(isinstance(median, dict), f"{label} {key} median is missing")
         for field in (*LATENCY_FIELDS, "throughput_per_second"):
             require(
-                isinstance(median.get(field), (int, float)),
-                f"{label} {key} median {field} is missing",
+                finite_nonnegative_number(median.get(field)),
+                f"{label} {key} median {field} is invalid",
             )
-        validate_repetitions(workload, f"{label} {key}")
+        validate_repetitions(workload, f"{label} {key}", pinned_cpu)
         for field in (*LATENCY_FIELDS, "throughput_per_second"):
             values = sorted(
                 repetition["statistics"][field]
@@ -328,6 +426,14 @@ def validate_common(
     require(artifact.get("canonical_warmup") == 10_000, f"{label} canonical warm-up differs")
     require(artifact.get("canonical_repetitions") == 5, f"{label} canonical repetitions differ")
     require(artifact.get("sample_count_override") == 0, f"{label} used a sample override")
+    require(
+        artifact.get("allocation_audit_attached") is True,
+        f"{label} allocation audit is not attached",
+    )
+    require(
+        artifact.get("public_process_completion_gate") == PUBLIC_GATE,
+        f"{label} absolute gate contract differs",
+    )
     for field in TIMING_FIELDS:
         require(field in artifact, f"{label} timing field {field} is missing")
     environment = artifact.get("environment")
@@ -339,12 +445,13 @@ def validate_common(
         and environment["affinity_mask"].isdigit(),
         f"{label} was not pinned to exactly one CPU",
     )
+    pinned_cpu = int(environment["affinity_mask"])
     require(
         environment.get("sibling_occupancy") not in (None, "", "not_observed"),
         f"{label} SMT sibling policy was not recorded",
     )
     validate_provenance(artifact, label)
-    return validate_workloads(artifact, label)
+    return validate_workloads(artifact, label, pinned_cpu)
 
 
 def validate_candidate_absolute_gates(
@@ -444,11 +551,51 @@ def timed_totals(
             )
             for field in totals:
                 require(
-                    isinstance(counters.get(field), int),
-                    f"timed allocation {field} missing",
+                    type(counters.get(field)) is int and counters[field] >= 0,
+                    f"timed allocation {field} is invalid",
                 )
                 totals[field] += counters[field]
     return totals
+
+
+def validate_allocation_evidence(
+    artifact: dict[str, Any], label: str,
+    workloads: dict[tuple[str, int], dict[str, Any]],
+    strict_process_zero: bool,
+) -> tuple[dict[str, int], dict[str, int]]:
+    process = timed_totals(workloads)
+    collection = timed_totals(workloads, "timed_sample_collection_allocations")
+    process_fields = {
+        "allocations": "timed_process_allocation_count",
+        "allocated_bytes": "timed_process_allocated_bytes",
+        "deallocations": "timed_process_deallocation_count",
+    }
+    collection_fields = {
+        "allocations": "timed_benchmark_owned_allocation_count",
+        "allocated_bytes": "timed_benchmark_owned_allocated_bytes",
+        "deallocations": "timed_benchmark_owned_deallocation_count",
+    }
+    for counter, field in process_fields.items():
+        require(
+            artifact.get(field) == process[counter],
+            f"{label} top-level process allocation total {field} is inconsistent",
+        )
+    for counter, field in collection_fields.items():
+        require(
+            artifact.get(field) == collection[counter],
+            f"{label} top-level benchmark allocation total {field} is inconsistent",
+        )
+    zero = {field: 0 for field in COUNTER_FIELDS}
+    require(
+        collection == zero
+        and artifact.get("timed_benchmark_owned_allocations_zero") is True,
+        f"{label} benchmark-owned timed allocation evidence is not zero",
+    )
+    if strict_process_zero:
+        require(process == zero, f"{label} timed process allocation evidence is not zero")
+    else:
+        require(process != zero, f"{label} does not evidence allocating Phase 1 storage")
+    return process, collection
 
 
 def compare_artifacts(
@@ -460,17 +607,38 @@ def compare_artifacts(
     )
     require(
         baseline.get("accepted_canonical_baseline") is True
+        and baseline.get("baseline_comparison_status") == "not_required"
         and baseline.get("final_canonical_acceptance") is True,
         "baseline is not an eligible accepted canonical baseline",
     )
     require(
         candidate.get("baseline_comparison_status") == "not_performed"
-        and candidate.get("final_canonical_acceptance") is False,
+        and candidate.get("final_canonical_acceptance") is False
+        and candidate.get("accepted_canonical_baseline") in (None, False)
+        and "baseline_comparison" not in candidate
+        and "relative_non_regression_compliant" not in candidate,
         "candidate comparison state is not pristine; a failed result cannot be promoted",
+    )
+    require(
+        baseline.get("allocation_policy") == "phase1_storage_diagnostic"
+        and baseline.get("strict_zero_allocation_applicable") is False,
+        "baseline allocation profile is invalid",
+    )
+    require(
+        candidate.get("allocation_policy") == "strict_total_zero"
+        and candidate.get("strict_zero_allocation_applicable") is True
+        and candidate.get("strict_zero_allocation_enforcement_milestone") == 10,
+        "candidate strict allocation profile is invalid",
     )
     validate_candidate_absolute_gates(old)
     validate_candidate_absolute_gates(current)
     compare_exact_configuration(baseline, candidate, old, current)
+    baseline_timed, baseline_collection = validate_allocation_evidence(
+        baseline, "baseline", old, False
+    )
+    candidate_timed, candidate_collection = validate_allocation_evidence(
+        candidate, "candidate", current, True
+    )
 
     comparisons: list[dict[str, Any]] = []
     relative_pass = True
@@ -542,21 +710,6 @@ def compare_artifacts(
             }
         )
 
-    baseline_timed = timed_totals(old)
-    candidate_timed = timed_totals(current)
-    baseline_collection = timed_totals(old, "timed_sample_collection_allocations")
-    candidate_collection = timed_totals(
-        current, "timed_sample_collection_allocations"
-    )
-    zero = {"allocations": 0, "allocated_bytes": 0, "deallocations": 0}
-    require(
-        candidate_timed == zero,
-        "candidate timed process allocation totals are not zero",
-    )
-    require(
-        baseline_collection == zero and candidate_collection == zero,
-        "benchmark-owned timed allocation totals are not zero",
-    )
     result = copy.deepcopy(candidate)
     result["baseline_comparison_status"] = "passed" if relative_pass else "failed"
     result["relative_non_regression_compliant"] = relative_pass
