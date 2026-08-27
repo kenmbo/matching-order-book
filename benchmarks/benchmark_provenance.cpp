@@ -27,6 +27,19 @@ namespace {
   return true;
 }
 
+[[nodiscard]] bool valid_git_commit(std::string_view value) noexcept {
+  if (value.size() != 40) {
+    return false;
+  }
+  for (const char character : value) {
+    if (!((character >= '0' && character <= '9') ||
+          (character >= 'a' && character <= 'f'))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 [[nodiscard]] bool contains_flag(const std::string& flags,
                                  std::string_view flag) {
   std::istringstream input(flags);
@@ -39,20 +52,49 @@ namespace {
   return false;
 }
 
+[[nodiscard]] bool contains_flag_prefix(const std::string& flags,
+                                        std::string_view prefix) {
+  std::istringstream input(flags);
+  std::string value;
+  while (input >> value) {
+    if (value.starts_with(prefix)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+[[nodiscard]] bool release_compile_flags_valid(const std::string& flags,
+                                               bool allocation_audit) {
+  const bool required =
+      contains_flag(flags, "-O3") && contains_flag(flags, "-march=native") &&
+      contains_flag(flags, "-ffast-math") &&
+      contains_flag(flags, "-Wall") && contains_flag(flags, "-Wextra") &&
+      contains_flag(flags, "-Werror") && contains_flag(flags, "-std=c++20") &&
+      contains_flag(flags, "-DNDEBUG") &&
+      (!allocation_audit ||
+       contains_flag(flags, "-DLOB_ENABLE_ALLOCATION_AUDIT=1"));
+  const bool incompatible =
+      contains_flag(flags, "-O0") || contains_flag(flags, "-O1") ||
+      contains_flag(flags, "-O2") || contains_flag(flags, "-Og") ||
+      contains_flag_prefix(flags, "-fsanitize=");
+  return required && !incompatible;
+}
+
+[[nodiscard]] bool release_link_flags_valid(const std::string& flags) {
+  return contains_flag(flags, "-O3") && contains_flag(flags, "-DNDEBUG") &&
+         !contains_flag_prefix(flags, "-fsanitize=");
+}
+
 [[nodiscard]] bool release_configuration_valid(
     const BuildProvenance& build) {
-  return build.build_type == "Release" && !build.compiler_id.empty() &&
-         !build.compiler_version.empty() && !build.compiler_banner.empty() &&
-         contains_flag(build.latency_compile_flags, "-O3") &&
-         contains_flag(build.latency_compile_flags, "-march=native") &&
-         contains_flag(build.latency_compile_flags, "-ffast-math") &&
-         contains_flag(build.latency_compile_flags, "-Wall") &&
-         contains_flag(build.latency_compile_flags, "-Wextra") &&
-         contains_flag(build.latency_compile_flags, "-Werror") &&
-         contains_flag(build.latency_compile_flags, "-std=c++20") &&
-         contains_flag(build.latency_compile_flags, "-DNDEBUG") &&
-         contains_flag(build.latency_link_flags, "-O3") &&
-         contains_flag(build.latency_link_flags, "-DNDEBUG");
+  return build.build_type == "Release" && build.compiler_id == "GNU" &&
+         build.compiler_version == "12.2.0" &&
+         !build.compiler_banner.empty() &&
+         release_compile_flags_valid(build.latency_compile_flags, false) &&
+         release_compile_flags_valid(build.allocation_compile_flags, true) &&
+         release_link_flags_valid(build.latency_link_flags) &&
+         release_link_flags_valid(build.allocation_link_flags);
 }
 
 [[nodiscard]] std::string shell_quote(std::string_view value) {
@@ -182,10 +224,18 @@ std::optional<BuildProvenance> read_build_provenance(
     }
   }
   if (!dirty_seen || result.source_root.empty() ||
-      result.source_commit.empty() || result.latency_executable.empty() ||
+      !valid_git_commit(result.source_commit) ||
+      result.compiler_id.empty() || result.compiler_version.empty() ||
+      result.compiler_banner.empty() || result.latency_executable.empty() ||
       result.allocation_executable.empty() ||
       !valid_sha256(result.latency_sha256) ||
-      !valid_sha256(result.allocation_sha256)) {
+      !valid_sha256(result.allocation_sha256) ||
+      result.latency_compile_command.empty() ||
+      result.latency_compile_flags.empty() ||
+      result.latency_link_command.empty() ||
+      result.allocation_compile_command.empty() ||
+      result.allocation_compile_flags.empty() ||
+      result.allocation_link_command.empty()) {
     return std::nullopt;
   }
   return result;
