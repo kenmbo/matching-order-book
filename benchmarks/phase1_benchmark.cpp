@@ -565,10 +565,9 @@ template <typename Domain, typename Source>
   const lob::benchmark::ExperimentConfiguration configuration{
       options.mode,          options.workload, options.seeds,
       options.samples_override, options.warmup,   options.repetitions,
-      options.cpu};
+      options.cpu,           options.sibling_occupancy};
   if (options.mode == "acceptance" &&
-      (!lob::benchmark::canonical_acceptance_configuration(configuration) ||
-       options.sibling_occupancy == "not_observed")) {
+      !lob::benchmark::canonical_acceptance_configuration(configuration)) {
     return std::nullopt;
   }
 #ifdef LOB_ENABLE_ALLOCATION_AUDIT
@@ -1479,7 +1478,9 @@ void write_distribution_json(
   }
   output << "LOB_PHASE2_POOL_ALLOCATION_V4 " << options.mode << ' '
          << options.repetitions << ' ' << options.warmup << ' '
-         << options.samples_override << ' ' << options.workload << '\n';
+         << options.samples_override << ' ' << options.workload << ' '
+         << options.cpu << ' ' << std::quoted(options.sibling_occupancy)
+         << '\n';
   output << "PROVENANCE " << std::quoted(provenance.build.source_commit) << ' '
          << (provenance.build.source_dirty_at_build ? 1 : 0) << ' '
          << std::quoted(provenance.build.latency_sha256) << ' '
@@ -1521,12 +1522,15 @@ void write_distribution_json(
   std::size_t warmup = 0;
   std::size_t samples_override = 0;
   std::string workload;
+  int cpu = -1;
+  std::string sibling_occupancy;
   if (!(input >> schema >> mode >> repetitions >> warmup >> samples_override >>
-        workload) ||
+        workload >> cpu >> std::quoted(sibling_occupancy)) ||
       schema != "LOB_PHASE2_POOL_ALLOCATION_V4" || mode != options.mode ||
       repetitions != options.repetitions || warmup != options.warmup ||
       samples_override != options.samples_override ||
-      workload != options.workload) {
+      workload != options.workload || cpu != options.cpu ||
+      sibling_occupancy != options.sibling_occupancy) {
     return {};
   }
   std::string kind;
@@ -1651,7 +1655,8 @@ void write_distribution_json(
       benchmark_owned_timed_activity.deallocations == 0;
   const lob::benchmark::ExperimentConfiguration configuration{
       options.mode, options.workload, options.seeds, options.samples_override,
-      options.warmup, options.repetitions, options.cpu};
+      options.warmup, options.repetitions, options.cpu,
+      options.sibling_occupancy};
   const bool canonical_configuration_valid =
       lob::benchmark::canonical_acceptance_configuration(configuration);
   const bool local_acceptance_passed =
@@ -2028,7 +2033,8 @@ void write_distribution_json(
   allocation_audit::Counters destruction_total;
   const lob::benchmark::ExperimentConfiguration configuration{
       options.mode, options.workload, options.seeds, options.samples_override,
-      options.warmup, options.repetitions, options.cpu};
+      options.warmup, options.repetitions, options.cpu,
+      options.sibling_occupancy};
   const bool locally_accepted =
       local_gates_passed &&
       lob::benchmark::canonical_acceptance_configuration(configuration) &&
