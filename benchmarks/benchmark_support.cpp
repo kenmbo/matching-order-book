@@ -31,7 +31,8 @@ bool canonical_acceptance_configuration(
          configuration.samples_override == 0 &&
          configuration.warmup == kCanonicalWarmup &&
          configuration.repetitions == kCanonicalRepetitions &&
-         configuration.cpu >= 0;
+         configuration.cpu >= 0 && !configuration.sibling_occupancy.empty() &&
+         configuration.sibling_occupancy != "not_observed";
 }
 
 std::size_t canonical_sample_count(std::string_view workload) noexcept {

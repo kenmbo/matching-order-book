@@ -28,6 +28,7 @@ struct ExperimentConfiguration final {
   std::size_t warmup{};
   std::size_t repetitions{};
   int cpu{-1};
+  std::string_view sibling_occupancy{};
 };
 
 enum class MixedOperation : std::uint8_t {
