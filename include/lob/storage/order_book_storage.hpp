@@ -202,10 +202,15 @@ class OrderBookStorage final {
 #endif
 
    private:
-    struct Entry final {
+    friend struct OrderBookStorageTestAccess;
+
+    using Control = std::uint8_t;
+    static constexpr Control kEmpty{0};
+    static constexpr Control kOccupied{1};
+
+    struct Payload final {
       OrderId order_id{};
       NodeLink link{};
-      bool occupied{};
     };
 
     [[nodiscard]] std::size_t bucket(OrderId order_id) const noexcept;
@@ -214,7 +219,8 @@ class OrderBookStorage final {
     std::size_t capacity_{};
     std::size_t mask_{};
     std::size_t size_{};
-    std::unique_ptr<Entry[]> entries_{};
+    std::unique_ptr<Control[]> controls_{};
+    std::unique_ptr<Payload[]> payloads_{};
   };
 
   [[nodiscard]] static NodeLink to_link(OrderHandle handle) noexcept;
