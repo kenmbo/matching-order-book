@@ -31,7 +31,8 @@ OrderBookStorage::ActiveOrderIndex::ActiveOrderIndex(
     capacity_ *= 2;
   }
   mask_ = capacity_ - 1;
-  entries_ = std::make_unique<Entry[]>(capacity_);
+  controls_ = std::make_unique<Control[]>(capacity_);
+  payloads_ = std::make_unique<Payload[]>(capacity_);
 }
 
 std::size_t OrderBookStorage::ActiveOrderIndex::bucket(
@@ -49,11 +50,10 @@ std::size_t OrderBookStorage::ActiveOrderIndex::find_position(
     OrderId order_id) const noexcept {
   auto position = bucket(order_id);
   for (std::size_t probe = 0; probe < capacity_; ++probe) {
-    const Entry& entry = entries_[position];
-    if (!entry.occupied) {
+    if (controls_[position] == kEmpty) {
       return capacity_;
     }
-    if (entry.order_id == order_id) {
+    if (payloads_[position].order_id == order_id) {
       return position;
     }
     position = (position + 1) & mask_;
@@ -64,13 +64,32 @@ std::size_t OrderBookStorage::ActiveOrderIndex::find_position(
 const OrderBookStorage::NodeLink*
 OrderBookStorage::ActiveOrderIndex::find(OrderId order_id) const noexcept {
   const auto position = find_position(order_id);
-  return position == capacity_ ? nullptr : &entries_[position].link;
+  return position == capacity_ ? nullptr : &payloads_[position].link;
 }
 
 OrderBookStorage::NodeLink* OrderBookStorage::ActiveOrderIndex::find(
     OrderId order_id) noexcept {
   const auto position = find_position(order_id);
-  return position == capacity_ ? nullptr : &entries_[position].link;
+  return position == capacity_ ? nullptr : &payloads_[position].link;
+}
+
+std::optional<OrderBookStorage::PreparedRemoval>
+OrderBookStorage::ActiveOrderIndex::prepare_removal(
+    OrderId order_id) const noexcept {
+  const auto position = find_position(order_id);
+  if (position == capacity_) {
+    return std::nullopt;
+  }
+  const Payload& payload = payloads_[position];
+  return PreparedRemoval{position, payload.order_id, payload.link};
+}
+
+bool OrderBookStorage::ActiveOrderIndex::matches_at(
+    std::size_t position, OrderId expected_order_id,
+    NodeLink expected_link) const noexcept {
+  return position < capacity_ && controls_[position] == kOccupied &&
+         payloads_[position].order_id == expected_order_id &&
+         payloads_[position].link == expected_link;
 }
 
 bool OrderBookStorage::ActiveOrderIndex::insert(OrderId order_id,
@@ -80,13 +99,13 @@ bool OrderBookStorage::ActiveOrderIndex::insert(OrderId order_id,
   }
   auto position = bucket(order_id);
   for (std::size_t probe = 0; probe < capacity_; ++probe) {
-    Entry& entry = entries_[position];
-    if (!entry.occupied) {
-      entry = {order_id, link, true};
+    if (controls_[position] == kEmpty) {
+      payloads_[position] = {order_id, link};
+      controls_[position] = kOccupied;
       ++size_;
       return true;
     }
-    if (entry.order_id == order_id) {
+    if (payloads_[position].order_id == order_id) {
       return false;
     }
     position = (position + 1) & mask_;
@@ -100,12 +119,33 @@ bool OrderBookStorage::ActiveOrderIndex::erase(OrderId order_id) noexcept {
     return false;
   }
 
-  entries_[position] = {};
+  controls_[position] = kEmpty;
   --size_;
   position = (position + 1) & mask_;
-  while (entries_[position].occupied) {
-    const Entry displaced = entries_[position];
-    entries_[position] = {};
+  while (controls_[position] == kOccupied) {
+    const Payload displaced = payloads_[position];
+    controls_[position] = kEmpty;
+    --size_;
+    if (!insert(displaced.order_id, displaced.link)) {
+      fail_storage_invariant();
+    }
+    position = (position + 1) & mask_;
+  }
+  return true;
+}
+
+bool OrderBookStorage::ActiveOrderIndex::erase_at(
+    std::size_t position, OrderId expected_order_id,
+    NodeLink expected_link) noexcept {
+  if (!matches_at(position, expected_order_id, expected_link)) {
+    return false;
+  }
+  controls_[position] = kEmpty;
+  --size_;
+  position = (position + 1) & mask_;
+  while (controls_[position] == kOccupied) {
+    const Payload displaced = payloads_[position];
+    controls_[position] = kEmpty;
     --size_;
     if (!insert(displaced.order_id, displaced.link)) {
       fail_storage_invariant();
@@ -116,9 +156,7 @@ bool OrderBookStorage::ActiveOrderIndex::erase(OrderId order_id) noexcept {
 }
 
 void OrderBookStorage::ActiveOrderIndex::clear() noexcept {
-  for (std::size_t index = 0; index < capacity_; ++index) {
-    entries_[index] = {};
-  }
+  std::fill_n(controls_.get(), capacity_, kEmpty);
   size_ = 0;
 }
 
@@ -132,7 +170,7 @@ std::size_t OrderBookStorage::ActiveOrderIndex::capacity() const noexcept {
 
 std::size_t OrderBookStorage::ActiveOrderIndex::backing_memory_bytes()
     const noexcept {
-  return capacity_ * sizeof(Entry);
+  return capacity_ * (sizeof(Control) + sizeof(Payload));
 }
 
 #ifndef NDEBUG
@@ -143,12 +181,15 @@ bool OrderBookStorage::ActiveOrderIndex::validate_invariants() const noexcept {
   }
   std::size_t occupied = 0;
   for (std::size_t index = 0; index < capacity_; ++index) {
-    const Entry& entry = entries_[index];
-    if (!entry.occupied) {
+    if (controls_[index] != kEmpty && controls_[index] != kOccupied) {
+      return false;
+    }
+    if (controls_[index] == kEmpty) {
       continue;
     }
-    if (!entry.order_id.is_valid() || entry.link.is_invalid() ||
-        find_position(entry.order_id) != index) {
+    const Payload& payload = payloads_[index];
+    if (!payload.order_id.is_valid() || payload.link.is_invalid() ||
+        find_position(payload.order_id) != index) {
       return false;
     }
     ++occupied;
@@ -396,6 +437,63 @@ OrderBookResult OrderBookStorage::remove_link(OrderId order_id,
   unlink_from_level(*price_level, link);
   if (!orders_.erase(order_id) ||
       order_pool_.release(to_handle(link)) != PoolReleaseStatus::Released) {
+    fail_storage_invariant();
+  }
+  if (aggregate.result == QuantityArithmeticResult::Zero) {
+    if (price_level->order_count != 0) {
+      fail_storage_invariant();
+    }
+    erase_level(side, level_position);
+  } else {
+    price_level->aggregate_leaves_quantity = aggregate.value;
+  }
+  return OrderBookResult::Accepted;
+}
+
+std::optional<OrderBookStorage::PreparedRemoval>
+OrderBookStorage::prepare_removal(OrderId order_id) const noexcept {
+  if (!order_id.is_valid()) {
+    return std::nullopt;
+  }
+  const auto prepared = orders_.prepare_removal(order_id);
+  if (!prepared || prepared->order_id != order_id) {
+    return std::nullopt;
+  }
+  const OrderRecord* order = get(prepared->link);
+  return order != nullptr && order->order_id == order_id
+             ? prepared
+             : std::nullopt;
+}
+
+OrderBookResult OrderBookStorage::remove_prepared(
+    const PreparedRemoval& prepared) noexcept {
+  if (!orders_.matches_at(prepared.active_index_position, prepared.order_id,
+                          prepared.link)) {
+    return OrderBookResult::OrderNotFound;
+  }
+  OrderRecord* order = get(prepared.link);
+  if (order == nullptr || order->order_id != prepared.order_id) {
+    return OrderBookResult::OrderNotFound;
+  }
+  PriceLevel* price_level = find_level(order->side, order->price);
+  if (price_level == nullptr) {
+    return OrderBookResult::OrderNotFound;
+  }
+  PriceLevel* levels = order->side == Side::Buy ? bids_.get() : asks_.get();
+  const Side side = order->side;
+  const auto level_position = static_cast<std::size_t>(price_level - levels);
+  const auto aggregate = checked_subtract(
+      price_level->aggregate_leaves_quantity, order->leaves_quantity);
+  if (aggregate.result != QuantityArithmeticResult::Success &&
+      aggregate.result != QuantityArithmeticResult::Zero) {
+    return OrderBookResult::InvalidQuantity;
+  }
+
+  unlink_from_level(*price_level, prepared.link);
+  if (!orders_.erase_at(prepared.active_index_position, prepared.order_id,
+                        prepared.link) ||
+      order_pool_.release(to_handle(prepared.link)) !=
+          PoolReleaseStatus::Released) {
     fail_storage_invariant();
   }
   if (aggregate.result == QuantityArithmeticResult::Zero) {
