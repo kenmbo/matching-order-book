@@ -31,8 +31,7 @@ OrderBookStorage::ActiveOrderIndex::ActiveOrderIndex(
     capacity_ *= 2;
   }
   mask_ = capacity_ - 1;
-  controls_ = std::make_unique<Control[]>(capacity_);
-  payloads_ = std::make_unique<Payload[]>(capacity_);
+  entries_ = std::make_unique<Entry[]>(capacity_);
 }
 
 std::size_t OrderBookStorage::ActiveOrderIndex::bucket(
@@ -50,10 +49,11 @@ std::size_t OrderBookStorage::ActiveOrderIndex::find_position(
     OrderId order_id) const noexcept {
   auto position = bucket(order_id);
   for (std::size_t probe = 0; probe < capacity_; ++probe) {
-    if (controls_[position] == kEmpty) {
+    const Entry& entry = entries_[position];
+    if (!entry.occupied) {
       return capacity_;
     }
-    if (payloads_[position].order_id == order_id) {
+    if (entry.order_id == order_id) {
       return position;
     }
     position = (position + 1) & mask_;
@@ -64,13 +64,13 @@ std::size_t OrderBookStorage::ActiveOrderIndex::find_position(
 const OrderBookStorage::NodeLink*
 OrderBookStorage::ActiveOrderIndex::find(OrderId order_id) const noexcept {
   const auto position = find_position(order_id);
-  return position == capacity_ ? nullptr : &payloads_[position].link;
+  return position == capacity_ ? nullptr : &entries_[position].link;
 }
 
 OrderBookStorage::NodeLink* OrderBookStorage::ActiveOrderIndex::find(
     OrderId order_id) noexcept {
   const auto position = find_position(order_id);
-  return position == capacity_ ? nullptr : &payloads_[position].link;
+  return position == capacity_ ? nullptr : &entries_[position].link;
 }
 
 bool OrderBookStorage::ActiveOrderIndex::insert(OrderId order_id,
@@ -80,13 +80,13 @@ bool OrderBookStorage::ActiveOrderIndex::insert(OrderId order_id,
   }
   auto position = bucket(order_id);
   for (std::size_t probe = 0; probe < capacity_; ++probe) {
-    if (controls_[position] == kEmpty) {
-      payloads_[position] = {order_id, link};
-      controls_[position] = kOccupied;
+    Entry& entry = entries_[position];
+    if (!entry.occupied) {
+      entry = {order_id, link, true};
       ++size_;
       return true;
     }
-    if (payloads_[position].order_id == order_id) {
+    if (entry.order_id == order_id) {
       return false;
     }
     position = (position + 1) & mask_;
@@ -100,12 +100,12 @@ bool OrderBookStorage::ActiveOrderIndex::erase(OrderId order_id) noexcept {
     return false;
   }
 
-  controls_[position] = kEmpty;
+  entries_[position] = {};
   --size_;
   position = (position + 1) & mask_;
-  while (controls_[position] == kOccupied) {
-    const Payload displaced = payloads_[position];
-    controls_[position] = kEmpty;
+  while (entries_[position].occupied) {
+    const Entry displaced = entries_[position];
+    entries_[position] = {};
     --size_;
     if (!insert(displaced.order_id, displaced.link)) {
       fail_storage_invariant();
@@ -116,7 +116,9 @@ bool OrderBookStorage::ActiveOrderIndex::erase(OrderId order_id) noexcept {
 }
 
 void OrderBookStorage::ActiveOrderIndex::clear() noexcept {
-  std::fill_n(controls_.get(), capacity_, kEmpty);
+  for (std::size_t index = 0; index < capacity_; ++index) {
+    entries_[index] = {};
+  }
   size_ = 0;
 }
 
@@ -130,7 +132,7 @@ std::size_t OrderBookStorage::ActiveOrderIndex::capacity() const noexcept {
 
 std::size_t OrderBookStorage::ActiveOrderIndex::backing_memory_bytes()
     const noexcept {
-  return capacity_ * (sizeof(Control) + sizeof(Payload));
+  return capacity_ * sizeof(Entry);
 }
 
 #ifndef NDEBUG
@@ -141,15 +143,12 @@ bool OrderBookStorage::ActiveOrderIndex::validate_invariants() const noexcept {
   }
   std::size_t occupied = 0;
   for (std::size_t index = 0; index < capacity_; ++index) {
-    if (controls_[index] != kEmpty && controls_[index] != kOccupied) {
-      return false;
-    }
-    if (controls_[index] == kEmpty) {
+    const Entry& entry = entries_[index];
+    if (!entry.occupied) {
       continue;
     }
-    const Payload& payload = payloads_[index];
-    if (!payload.order_id.is_valid() || payload.link.is_invalid() ||
-        find_position(payload.order_id) != index) {
+    if (!entry.order_id.is_valid() || entry.link.is_invalid() ||
+        find_position(entry.order_id) != index) {
       return false;
     }
     ++occupied;
