@@ -98,8 +98,7 @@ NewOrderResult MatchingEngine::process(const NewOrder& order) noexcept {
 
 CancelOrderResult MatchingEngine::process(const CancelOrder& order) noexcept {
   CancelOrderResult result;
-  std::optional<OrderBookStorage::PreparedRemoval> prepared;
-  result.result = validate_cancel_order(order, prepared);
+  result.result = validate_cancel_order(order);
   if (result.result != OrderBookResult::Accepted) {
     sequences_.reject_before_acceptance();
     return result;
@@ -111,8 +110,7 @@ CancelOrderResult MatchingEngine::process(const CancelOrder& order) noexcept {
   }
 
   result.command_sequence = accept_command();
-  if (!prepared ||
-      storage_.remove_prepared(*prepared) != OrderBookResult::Accepted) {
+  if (storage_.remove_resting(order.order_id) != OrderBookResult::Accepted) {
     fail_plan_execution();
   }
   const auto event_batch = sequences_.commit_event_batch(0);
@@ -294,9 +292,7 @@ OrderBookResult MatchingEngine::validate_new_order(
 }
 
 OrderBookResult MatchingEngine::validate_cancel_order(
-    const CancelOrder& order,
-    std::optional<OrderBookStorage::PreparedRemoval>& prepared) const
-    noexcept {
+    const CancelOrder& order) const noexcept {
   if (!storage_.instrument_id().is_valid() ||
       order.instrument_id != storage_.instrument_id()) {
     return OrderBookResult::InvalidInstrument;
@@ -308,11 +304,7 @@ OrderBookResult MatchingEngine::validate_cancel_order(
       instrument_state_ != InstrumentState::Halted) {
     return OrderBookResult::InstrumentUnavailable;
   }
-  if (!order.order_id.is_valid()) {
-    return OrderBookResult::OrderNotFound;
-  }
-  prepared = storage_.prepare_removal(order.order_id);
-  if (!prepared) {
+  if (!order.order_id.is_valid() || !storage_.find_order(order.order_id)) {
     return OrderBookResult::OrderNotFound;
   }
   return OrderBookResult::Accepted;
