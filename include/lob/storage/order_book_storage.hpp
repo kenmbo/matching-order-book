@@ -14,7 +14,6 @@
 
 namespace lob {
 
-class MatchingEngine;
 struct OrderBookStorageTestAccess;
 
 struct StorageLimits final {
@@ -144,7 +143,6 @@ class OrderBookStorage final {
 #endif
 
  private:
-  friend class MatchingEngine;
   friend struct OrderBookStorageTestAccess;
 
   struct NodeLink final {
@@ -173,12 +171,6 @@ class OrderBookStorage final {
   using OrderPool = FixedObjectPool<OrderRecord>;
   using OrderHandle = OrderPool::Handle;
 
-  struct PreparedRemoval final {
-    std::size_t active_index_position{};
-    OrderId order_id{};
-    NodeLink link{};
-  };
-
   struct PriceLevel final {
     PriceTicks price{};
     Quantity aggregate_leaves_quantity{};
@@ -199,16 +191,8 @@ class OrderBookStorage final {
 
     [[nodiscard]] const NodeLink* find(OrderId order_id) const noexcept;
     [[nodiscard]] NodeLink* find(OrderId order_id) noexcept;
-    [[nodiscard]] std::optional<PreparedRemoval> prepare_removal(
-        OrderId order_id) const noexcept;
-    [[nodiscard]] bool matches_at(std::size_t position,
-                                  OrderId expected_order_id,
-                                  NodeLink expected_link) const noexcept;
     [[nodiscard]] bool insert(OrderId order_id, NodeLink link) noexcept;
     [[nodiscard]] bool erase(OrderId order_id) noexcept;
-    [[nodiscard]] bool erase_at(std::size_t position,
-                                OrderId expected_order_id,
-                                NodeLink expected_link) noexcept;
     void clear() noexcept;
     [[nodiscard]] std::size_t size() const noexcept;
     [[nodiscard]] std::size_t capacity() const noexcept;
@@ -218,15 +202,10 @@ class OrderBookStorage final {
 #endif
 
    private:
-    friend struct OrderBookStorageTestAccess;
-
-    using Control = std::uint8_t;
-    static constexpr Control kEmpty{0};
-    static constexpr Control kOccupied{1};
-
-    struct Payload final {
+    struct Entry final {
       OrderId order_id{};
       NodeLink link{};
+      bool occupied{};
     };
 
     [[nodiscard]] std::size_t bucket(OrderId order_id) const noexcept;
@@ -235,8 +214,7 @@ class OrderBookStorage final {
     std::size_t capacity_{};
     std::size_t mask_{};
     std::size_t size_{};
-    std::unique_ptr<Control[]> controls_{};
-    std::unique_ptr<Payload[]> payloads_{};
+    std::unique_ptr<Entry[]> entries_{};
   };
 
   [[nodiscard]] static NodeLink to_link(OrderHandle handle) noexcept;
@@ -253,10 +231,6 @@ class OrderBookStorage final {
   void erase_level(Side side, std::size_t position) noexcept;
   [[nodiscard]] OrderBookResult remove_link(OrderId order_id,
                                             NodeLink link) noexcept;
-  [[nodiscard]] std::optional<PreparedRemoval> prepare_removal(
-      OrderId order_id) const noexcept;
-  [[nodiscard]] OrderBookResult remove_prepared(
-      const PreparedRemoval& prepared) noexcept;
   void append_to_level(PriceLevel& level, NodeLink link) noexcept;
   void unlink_from_level(PriceLevel& level, NodeLink link) noexcept;
   [[nodiscard]] std::vector<RestingOrderView> level_orders(

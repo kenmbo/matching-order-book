@@ -134,9 +134,7 @@ class MatchingEngine final {
   [[nodiscard]] OrderBookResult validate_new_order(
       const NewOrder& order) const noexcept;
   [[nodiscard]] OrderBookResult validate_cancel_order(
-      const CancelOrder& order,
-      std::optional<OrderBookStorage::PreparedRemoval>& prepared) const
-      noexcept;
+      const CancelOrder& order) const noexcept;
   [[nodiscard]] OrderBookResult validate_amend_order(
       const AmendOrder& order,
       const std::optional<RestingOrderView>& resting) const noexcept;
